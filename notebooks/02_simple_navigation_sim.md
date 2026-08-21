@@ -208,13 +208,3 @@ plt.show()
 ```
 
 ---
-
-## Summary
-
-You have now demonstrated the full hierarchical idea of NaVILA:
-
-1. **High-level** converts language into mid-level spatial commands
-2. **Low-level** executes those commands and produces motion
-3. The interface between them is clean and interpretable
-
-This is the core design philosophy we are following.
