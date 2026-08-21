@@ -74,4 +74,3 @@ This has several advantages:
 1. **Hierarchy over end-to-end** – Do not predict joint actions directly from the VLA.
 2. **Clear separation of concerns** – High-level reasons about *what* to do, low-level handles *how* to do it safely.
 3. **Runnable on limited hardware** – Focus on the high-level reasoning part that can run on T4 / consumer GPUs.
-4. **Documentation first** – Make the ideas easy for a reviewer (or Fauzy) to understand quickly.
