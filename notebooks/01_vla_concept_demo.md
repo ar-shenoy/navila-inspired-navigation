@@ -120,8 +120,3 @@ for instr in test_cases:
 In a full system the `SimpleLanguagePlanner` would be replaced by a large VLM that also looks at the camera image.
 
 ---
-
-## Next
-
-- `02_simple_navigation_sim.ipynb` → connect the mid-level command to a basic controller
-- Later: replace the rule-based planner with a real (small) Vision-Language model that can run on T4
