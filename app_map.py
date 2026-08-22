@@ -74,21 +74,13 @@ class HybridPlanner:
         if "km" in text or distance >= 1000:
             if "km" in text:
                 distance = value * 1000 if value else 1000
-            # else already in meters
-        elif distance > 300 and "m" not in text and "meter" not in text:
-            # ambiguous large number → treat as meters
-            pass
 
         return MidLevelCommand("move_forward", distance, "heuristic")
 
     def parse_multiple(self, instruction: str) -> List[MidLevelCommand]:
         """
         Support multiple commands in one sentence.
-        Examples:
-        - "move 200m and turn left 90 degree"
-        - "move 200m turn right then move 400m and turn right 40 degree"
         """
-        # Split by common separators
         parts = re.split(r",| and | then |\.", instruction.lower())
         parts = [p.strip() for p in parts if p.strip()]
 
@@ -108,10 +100,10 @@ class HybridPlanner:
 # Map Controller with basic obstacle avoidance
 # -------------------------------------------------
 class MapController:
-    def __init__(self, start_lat=25.0330, start_lon=121.5654):  # Taipei default
+    def __init__(self, start_lat=25.0330, start_lon=121.5654):
         self.state = RobotState(lat=start_lat, lon=start_lon, yaw=0.0)
         self.path: List[Tuple[float, float]] = [(start_lat, start_lon)]
-        self.obstacles: List[Tuple[float, float, float]] = []  # lat, lon, radius_m
+        self.obstacles: List[Tuple[float, float, float]] = []
 
     def reset(self, lat, lon, yaw=0.0):
         self.state = RobotState(lat=lat, lon=lon, yaw=yaw)
@@ -121,7 +113,6 @@ class MapController:
         self.obstacles = obstacles
 
     def _distance_m(self, lat1, lon1, lat2, lon2):
-        # Haversine approx for small distances
         R = 6371000
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         dphi = math.radians(lat2 - lat1)
@@ -145,7 +136,6 @@ class MapController:
         new_lat = self.state.lat + dlat
         new_lon = self.state.lon + dlon
 
-        # Simple avoidance: try small turns if collision
         if self._is_collision(new_lat, new_lon):
             for delta in [25, -25, 45, -45, 70, -70]:
                 test_yaw = (self.state.yaw + delta) % 360
@@ -159,7 +149,7 @@ class MapController:
                     self.state.lon = tlon
                     self.path.append((tlat, tlon))
                     return
-            return  # stuck
+            return
 
         self.state.lat = new_lat
         self.state.lon = new_lon
@@ -171,8 +161,7 @@ class MapController:
 
         if cmd.action == "move_forward":
             dist = cmd.value if cmd.value is not None else 20.0
-            # Move in small steps
-            step_size = 4.0  # meters per step
+            step_size = 4.0
             steps = max(1, int(dist / step_size))
             actual_step = dist / steps
             for _ in range(steps):
@@ -198,7 +187,6 @@ st.markdown("""
 High-level language → Mid-level commands → Movement + basic obstacle avoidance
 """)
 
-# Locations (including Taiwan)
 LOCATIONS = {
     "Taipei 101": (25.0330, 121.5654),
     "National Taiwan University": (25.0170, 121.5395),
@@ -222,7 +210,6 @@ with st.sidebar:
     execute_btn = col1.button("Execute", type="primary")
     reset_btn = col2.button("Reset")
 
-# Session state
 if "controller" not in st.session_state:
     lat, lon = LOCATIONS["Taipei 101"]
     st.session_state.controller = MapController(lat, lon)
@@ -245,7 +232,6 @@ if execute_btn and instruction.strip():
             "source": cmd.source
         })
 
-# Obstacles example (around Taipei 101 area for demo)
 ctrl = st.session_state.controller
 if location_name == "Taipei 101":
     ctrl.set_obstacles([
@@ -255,14 +241,11 @@ if location_name == "Taipei 101":
 else:
     ctrl.set_obstacles([])
 
-# Create map
 m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=16, tiles="OpenStreetMap")
 
-# Path
 if len(ctrl.path) > 1:
     folium.PolyLine(ctrl.path, color="#0066ff", weight=6, opacity=0.85).add_to(m)
 
-# Obstacles
 for olat, olon, rad in ctrl.obstacles:
     folium.Circle(
         location=[olat, olon],
@@ -273,11 +256,9 @@ for olat, olon, rad in ctrl.obstacles:
         popup="Obstacle"
     ).add_to(m)
 
-# Start
 if ctrl.path:
     folium.CircleMarker(ctrl.path[0], radius=7, color="green", fill=True, fill_color="lime").add_to(m)
 
-# Robot
 folium.Marker(
     [ctrl.state.lat, ctrl.state.lon],
     popup=f"Yaw: {ctrl.state.yaw:.1f}°",
@@ -286,7 +267,6 @@ folium.Marker(
 
 st_folium(m, width=950, height=580)
 
-# Info
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Robot State")
@@ -298,8 +278,7 @@ with col_b:
     st.subheader("Executed Commands")
     if st.session_state.history:
         for h in reversed(st.session_state.history[-6:]):
-            st.markdown(f"`{h['command']}`  
-<span style='color:gray;font-size:0.85em'>({h['source']})</span>", unsafe_allow_html=True)
+            st.markdown(f"`{h['command']}`  \n<span style='color:gray;font-size:0.85em'>({h['source']})</span>", unsafe_allow_html=True)
     else:
         st.info("No commands executed yet.")
 
