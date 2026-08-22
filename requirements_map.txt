@@ -2,3 +2,6 @@ streamlit
 folium
 streamlit-folium
 numpy
+osmnx
+geopandas
+shapely
