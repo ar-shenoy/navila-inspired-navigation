@@ -1,47 +1,113 @@
-# NaVILA-Inspired Language-Guided Navigation
+# NaVILA-Lite
 
-A simplified yet structured exploration of **Vision-Language-Action (VLA)** models for robot navigation, inspired by [NaVILA](https://navila-bot.github.io/) (RSS 2025).
+**Hierarchical Vision-Language Navigation Demo**  
+Inspired by [NaVILA (RSS 2025)](https://navila-bot.github.io/)
 
-This repository demonstrates understanding of hierarchical VLA + locomotion architectures and provides runnable prototypes that can run on limited hardware (Kaggle T4 / consumer GPUs).
-
----
-
-## Motivation
-
-NaVILA proposes a clean two-level framework for legged robot navigation:
-
-- **High-level**: A Vision-Language model that takes RGB observations + language instructions and outputs **mid-level spatial commands** (e.g. “move forward 75cm”, “turn left”).
-- **Low-level**: A visual locomotion policy that executes these commands while handling obstacle avoidance and balance.
-
-Directly predicting low-level joint actions from a VLA is difficult. NaVILA’s hierarchical design makes the system more generalizable and easier to transfer across robots.
-
-This project aims to:
-1. Deeply understand and document the NaVILA architecture
-2. Implement a simplified high-level language planner
-3. Show how such a system can be connected to a low-level controller
-4. Discuss practical limitations when running on limited hardware (no Isaac Sim GPU)
+A lightweight, end-to-end hierarchical navigation system that separates high-level language reasoning from low-level reactive control.
 
 ---
 
-## Repository Structure
+## Key Idea (from NaVILA)
+
+Instead of predicting low-level actions directly from a Vision-Language model, NaVILA uses a clean two-level design:
+
+1. **High-level** → Vision-Language model outputs mid-level spatial commands  
+   (`move_forward 0.8`, `turn_left 30`, `stop`, ...)
+2. **Low-level** → A reactive / RL-inspired controller executes these commands while handling obstacles.
+
+This project implements a practical, runnable version of that idea that works on limited hardware (Kaggle T4 / free-tier resources).
+
+---
+
+## Features
+
+- Hybrid High-Level Planner
+  - Tries a real lightweight VLM (SmolVLM)
+  - Automatically falls back to a strong heuristic when the VLM output is unreliable
+- Low-Level Controller with explicit reward function (progress, collision penalty, time penalty, success bonus)
+- Reactive obstacle avoidance
+- Multiple environments
+- Interactive demo (user can type instructions)
+- Clean visualization of the robot trajectory and state
+
+---
+
+## Project Structure
 
 ```text
 navila-inspired-navigation/
 ├── README.md
 ├── docs/
-│   ├── architecture.md          # Detailed system design
-│   ├── navila_analysis.md       # Paper analysis
-│   └── limitations.md           # Hardware & practical constraints
-├── notebooks/
-│   ├── 01_vla_concept_demo.ipynb
-│   └── 02_simple_navigation_sim.ipynb
+│   ├── architecture.md
+│   ├── navila_analysis.md
+│   └── limitations.md
 ├── src/
 │   ├── high_level/
-│   │   └── language_planner.py
+│   │   ├── vlm_planner.py          # Hybrid VLM + heuristic planner
+│   │   └── ...
 │   ├── low_level/
-│   │   └── simple_controller.py
-│   └── utils/
-├── assets/
-│   └── diagrams/
-├── requirements.txt
-└── .gitignore
+│   │   └── rl_controller.py        # Reward-based reactive controller
+│   └── visualization/
+├── notebooks/
+│   └── final_demo.ipynb            # Main interactive demo
+└── requirements.txt
+```
+
+---
+
+## How to Run (Kaggle)
+
+1. Open the final demo notebook
+2. Run all cells
+3. Type natural language instructions and execute them
+4. Watch the robot navigate while avoiding obstacles
+
+The system will show:
+- Which planner was used (`vlm` or `heuristic`)
+- Mid-level command generated
+- Reward obtained
+- Current robot state
+
+---
+
+## Design Decisions
+
+| Component              | Choice                              | Reason |
+|------------------------|-------------------------------------|--------|
+| High-level             | Hybrid (SmolVLM + heuristic)        | Real VLM when possible + robustness |
+| Low-level              | Explicit reward + reactive policy   | Lightweight, interpretable, no heavy training |
+| Simulation             | Top-down / 3D visualization         | Runs easily on free compute |
+| Hardware target        | Kaggle T4 / free HF Spaces          | Accessible |
+
+---
+
+## Limitations
+
+- The small VLM (SmolVLM-500M) is not perfectly reliable for structured navigation commands → hybrid fallback is necessary.
+- Full physics 3D simulation (Isaac Sim style) is not feasible on free-tier hardware.
+- This is a research-oriented prototype demonstrating the hierarchical idea, not a production robot stack.
+
+See `docs/limitations.md` for more details.
+
+---
+
+## Future Work
+
+- Better fine-tuned small VLM for navigation commands
+- Stronger low-level policy (learned)
+- Proper 3D web visualization (Three.js)
+- Integration path toward Isaac Sim / real robots
+
+---
+
+## References
+
+- Cheng et al., **NaVILA: Legged Robot Vision-Language-Action Model for Navigation**, RSS 2025  
+  https://navila-bot.github.io/
+- SmolVLM (Hugging Face)
+
+---
+
+## Author
+
+Built as an exploration project for hierarchical Vision-Language-Action navigation systems.
