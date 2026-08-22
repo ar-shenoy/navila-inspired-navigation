@@ -48,7 +48,7 @@ class MidLevelCommand:
 class RobotState:
     lat: float
     lon: float
-    yaw: float = 0.0  # degrees, 0 = North, increases clockwise? we use math convention carefully
+    yaw: float = 0.0
 
 
 # -------------------------------------------------
@@ -99,14 +99,14 @@ class HybridPlanner:
 
 
 # -------------------------------------------------
-# Map Controller with real / fallback obstacles
+# Map Controller
 # -------------------------------------------------
 class MapController:
     def __init__(self, start_lat=25.0330, start_lon=121.5654):
         self.state = RobotState(lat=start_lat, lon=start_lon, yaw=0.0)
         self.path: List[Tuple[float, float]] = [(start_lat, start_lon)]
-        self.obstacles: List[Tuple[float, float, float]] = []  # lat, lon, radius_m
-        self.building_polys = []  # optional list of polygons
+        self.obstacles: List[Tuple[float, float, float]] = []
+        self.building_polys = []
 
     def reset(self, lat, lon, yaw=0.0):
         self.state = RobotState(lat=lat, lon=lon, yaw=yaw)
@@ -117,12 +117,10 @@ class MapController:
         self.obstacles = obstacles
 
     def load_buildings_around(self, lat, lon, dist=120):
-        """Try to load real buildings with OSMnx. Fallback to empty."""
         self.building_polys = []
         if not HAS_OSMNX:
             return False
         try:
-            # Download buildings around point
             tags = {"building": True}
             gdf = ox.features_from_point((lat, lon), tags=tags, dist=dist)
             if gdf is not None and not gdf.empty:
@@ -150,7 +148,6 @@ class MapController:
         return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
     def _point_in_poly(self, lat, lon, poly_coords):
-        """Simple ray casting for point in polygon (lon, lat order)."""
         x, y = lon, lat
         inside = False
         n = len(poly_coords)
@@ -164,23 +161,19 @@ class MapController:
         return inside
 
     def _is_collision(self, lat, lon, robot_radius=4.0):
-        # Check circular obstacles
         for olat, olon, radius in self.obstacles:
             if self._distance_m(lat, lon, olat, olon) < (radius + robot_radius):
                 return True
-        # Check real building polygons
         for poly in self.building_polys:
             if self._point_in_poly(lat, lon, poly):
                 return True
         return False
 
     def _move_step(self, distance_m: float):
-        # yaw: 0 = East in standard math? We define 0 = North for map intuition
-        # Convert: math angle = 90 - yaw
         math_angle = math.radians(90.0 - self.state.yaw)
 
-        dy = distance_m * math.sin(math_angle)   # North component
-        dx = distance_m * math.cos(math_angle)   # East component
+        dy = distance_m * math.sin(math_angle)
+        dx = distance_m * math.cos(math_angle)
 
         dlat = dy / 111320.0
         dlon = dx / (111320.0 * math.cos(math.radians(self.state.lat)) + 1e-8)
@@ -189,7 +182,6 @@ class MapController:
         new_lon = self.state.lon + dlon
 
         if self._is_collision(new_lat, new_lon):
-            # Reactive avoidance
             for delta in [20, -20, 40, -40, 60, -60, 90, -90]:
                 test_yaw = (self.state.yaw + delta) % 360
                 math_a = math.radians(90.0 - test_yaw)
@@ -203,7 +195,7 @@ class MapController:
                     self.state.lon = tlon
                     self.path.append((tlat, tlon))
                     return
-            return  # completely stuck
+            return
 
         self.state.lat = new_lat
         self.state.lon = new_lon
@@ -223,20 +215,15 @@ class MapController:
 
         elif cmd.action == "turn_left":
             angle = cmd.value if cmd.value is not None else 30.0
-            self.state.yaw = (self.state.yaw - angle) % 360   # left = counter-clockwise on map
+            self.state.yaw = (self.state.yaw - angle) % 360
 
         elif cmd.action == "turn_right":
             angle = cmd.value if cmd.value is not None else 30.0
             self.state.yaw = (self.state.yaw + angle) % 360
 
 
-# -------------------------------------------------
-# Helper: create rotated marker for heading
-# -------------------------------------------------
 def create_heading_marker(lat, lon, yaw):
-    """Create a simple DivIcon arrow that roughly shows heading."""
-    # CSS rotation
-    rotation = yaw  # adjust if needed
+    rotation = yaw
     html = f"""
     <div style="
         transform: rotate({rotation}deg);
@@ -306,7 +293,6 @@ if reset_btn:
 
 ctrl = st.session_state.controller
 
-# Load buildings on demand
 if load_buildings and not st.session_state.buildings_loaded and HAS_OSMNX:
     with st.spinner("Loading real buildings from OpenStreetMap..."):
         success = ctrl.load_buildings_around(ctrl.state.lat, ctrl.state.lon, dist=150)
@@ -328,7 +314,6 @@ if execute_btn and instruction.strip():
             "source": cmd.source
         })
 
-# Fallback artificial obstacles if no buildings
 if len(ctrl.building_polys) == 0 and location_name == "Taipei 101":
     ctrl.set_obstacles([
         (25.0340, 121.5660, 20),
@@ -337,46 +322,33 @@ if len(ctrl.building_polys) == 0 and location_name == "Taipei 101":
 else:
     ctrl.set_obstacles([])
 
-# --------------- Map ---------------
-m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=17,
-               tiles="OpenStreetMap")
+m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=17, tiles="OpenStreetMap")
 
-# Alternative tiles
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
 
-# Path
 if len(ctrl.path) > 1:
     folium.PolyLine(ctrl.path, color="#0066ff", weight=6, opacity=0.85, tooltip="Path").add_to(m)
 
-# Real buildings (simplified as polygons)
-for poly in ctrl.building_polys[:80]:  # limit for performance
+for poly in ctrl.building_polys[:80]:
     try:
-        # poly is list of (lon, lat)
         locations = [(lat, lon) for lon, lat in poly]
-        folium.Polygon(locations, color="#e74c3c", weight=1,
-                       fill=True, fill_opacity=0.25).add_to(m)
+        folium.Polygon(locations, color="#e74c3c", weight=1, fill=True, fill_opacity=0.25).add_to(m)
     except Exception:
         pass
 
-# Circular obstacles
 for olat, olon, rad in ctrl.obstacles:
-    folium.Circle(location=[olat, olon], radius=rad, color="red",
-                  fill=True, fill_opacity=0.3, popup="Obstacle").add_to(m)
+    folium.Circle(location=[olat, olon], radius=rad, color="red", fill=True, fill_opacity=0.3, popup="Obstacle").add_to(m)
 
-# Start point
 if ctrl.path:
-    folium.CircleMarker(ctrl.path[0], radius=6, color="green",
-                        fill=True, fill_color="lime", popup="Start").add_to(m)
+    folium.CircleMarker(ctrl.path[0], radius=6, color="green", fill=True, fill_color="lime", popup="Start").add_to(m)
 
-# Robot with heading
 create_heading_marker(ctrl.state.lat, ctrl.state.lon, ctrl.state.yaw).add_to(m)
 
 folium.LayerControl().add_to(m)
 
 st_folium(m, width=980, height=600)
 
-# Info panels
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Robot State")
@@ -388,8 +360,10 @@ with col_b:
     st.subheader("Executed Commands")
     if st.session_state.history:
         for h in reversed(st.session_state.history[-8:]):
-            st.markdown(f"`{h['command']}`  
-<span style='color:gray;font-size:0.85em'>({h['source']})</span>", unsafe_allow_html=True)
+            st.markdown(
+                f"`{h['command']}`  <span style='color:gray;font-size:0.85em'>({h['source']})</span>",
+                unsafe_allow_html=True
+            )
     else:
         st.info("No commands executed yet.")
 
