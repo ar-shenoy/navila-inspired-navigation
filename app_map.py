@@ -1,6 +1,6 @@
 """
-NaVILA-Lite – Map-based Hierarchical Navigation
-Fast version: building loading is OFF by default so the app starts quickly.
+NaVILA-Lite - Clean & Reliable Map Navigation
+Focus: Correct movement direction + fast startup
 """
 
 import streamlit as st
@@ -11,12 +11,9 @@ import re
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
-try:
-    import osmnx as ox
-    HAS_OSMNX = True
-except ImportError:
-    HAS_OSMNX = False
-
+# -------------------------------------------------
+# Data
+# -------------------------------------------------
 @dataclass
 class MidLevelCommand:
     action: str
@@ -36,241 +33,173 @@ class MidLevelCommand:
 class RobotState:
     lat: float
     lon: float
-    yaw: float = 0.0  # 0 = North, 90 = East
+    yaw: float = 0.0  # 0 = North, 90 = East, 180 = South, 270 = West
 
+# -------------------------------------------------
+# Planner
+# -------------------------------------------------
 class HybridPlanner:
     def __init__(self):
         self.forward_words = ["forward", "ahead", "straight", "go", "move", "walk", "advance"]
         self.left_words = ["left"]
         self.right_words = ["right"]
-        self.stop_words = ["stop", "halt", "wait", "stay"]
+        self.stop_words = ["stop", "halt", "wait"]
 
     def _parse_single(self, text: str) -> MidLevelCommand:
         text = text.lower().strip()
         if any(w in text for w in self.stop_words):
-            return MidLevelCommand("stop", source="heuristic")
+            return MidLevelCommand("stop")
 
         numbers = re.findall(r"(\d+\.?\d*)", text)
         value = float(numbers[0]) if numbers else None
 
         if any(w in text for w in self.left_words):
-            angle = value if value is not None else 30.0
-            return MidLevelCommand("turn_left", angle, "heuristic")
+            return MidLevelCommand("turn_left", value if value is not None else 90.0)
         if any(w in text for w in self.right_words):
-            angle = value if value is not None else 30.0
-            return MidLevelCommand("turn_right", angle, "heuristic")
+            return MidLevelCommand("turn_right", value if value is not None else 90.0)
 
-        distance = value if value is not None else 20.0
+        distance = value if value is not None else 30.0
         if "km" in text:
-            distance = (value if value is not None else 1.0) * 1000.0
-        return MidLevelCommand("move_forward", distance, "heuristic")
+            distance = (value if value else 1.0) * 1000.0
+        return MidLevelCommand("move_forward", distance)
 
     def parse_multiple(self, instruction: str) -> List[MidLevelCommand]:
         parts = re.split(r",| and | then |\.", instruction.lower())
         parts = [p.strip() for p in parts if p.strip()]
-        commands = []
-        for part in parts:
-            if any(w in part for w in self.forward_words + self.left_words + self.right_words + self.stop_words):
-                commands.append(self._parse_single(part))
-        if not commands:
-            commands.append(self._parse_single(instruction))
-        return commands
+        cmds = []
+        for p in parts:
+            if any(w in p for w in self.forward_words + self.left_words + self.right_words + self.stop_words):
+                cmds.append(self._parse_single(p))
+        if not cmds:
+            cmds.append(self._parse_single(instruction))
+        return cmds
 
+# -------------------------------------------------
+# Controller - CORRECTED MATH
+# -------------------------------------------------
 class MapController:
-    def __init__(self, start_lat, start_lon, yaw=0.0):
-        self.state = RobotState(lat=start_lat, lon=start_lon, yaw=yaw)
-        self.path: List[Tuple[float, float]] = [(start_lat, start_lon)]
-        self.obstacles: List[Tuple[float, float, float]] = []
-        self.building_polys = []
-        self.last_building_center = (start_lat, start_lon)
+    def __init__(self, lat, lon, yaw=0.0):
+        self.state = RobotState(lat, lon, yaw)
+        self.path = [(lat, lon)]
 
     def reset(self, lat, lon, yaw=0.0):
-        self.state = RobotState(lat=lat, lon=lon, yaw=yaw)
+        self.state = RobotState(lat, lon, yaw)
         self.path = [(lat, lon)]
-        self.building_polys = []
-        self.obstacles = []
-        self.last_building_center = (lat, lon)
 
-    def set_obstacles(self, obstacles):
-        self.obstacles = obstacles
-
-    def load_buildings_around(self, lat, lon, dist=100):
-        if not HAS_OSMNX:
-            return False
-        try:
-            tags = {"building": True}
-            gdf = ox.features_from_point((lat, lon), tags=tags, dist=dist)
-            new_polys = []
-            if gdf is not None and not gdf.empty:
-                for geom in gdf.geometry:
-                    if geom is None:
-                        continue
-                    if geom.geom_type == "Polygon":
-                        new_polys.append(list(geom.exterior.coords))
-                    elif geom.geom_type == "MultiPolygon":
-                        for poly in geom.geoms:
-                            new_polys.append(list(poly.exterior.coords))
-            self.building_polys = new_polys[-60:]  # keep it light
-            self.last_building_center = (lat, lon)
-            return len(new_polys) > 0
-        except Exception:
-            return False
-
-    def _distance_m(self, lat1, lon1, lat2, lon2):
-        R = 6371000.0
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    def _point_in_poly(self, lat, lon, poly_coords):
-        x, y = lon, lat
-        inside = False
-        n = len(poly_coords)
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly_coords[i][0], poly_coords[i][1]
-            xj, yj = poly_coords[j][0], poly_coords[j][1]
-            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
-                inside = not inside
-            j = i
-        return inside
-
-    def _is_collision(self, lat, lon, robot_radius=3.0):
-        for olat, olon, radius in self.obstacles:
-            if self._distance_m(lat, lon, olat, olon) < (radius + robot_radius):
-                return True
-        for poly in self.building_polys:
-            if self._point_in_poly(lat, lon, poly):
-                return True
-        return False
-
-    def _move_step(self, distance_m: float):
+    def _move_forward(self, distance_m: float):
+        """
+        yaw = 0   → North
+        yaw = 90  → East
+        yaw = 180 → South
+        yaw = 270 → West
+        """
         rad = math.radians(self.state.yaw)
+
+        # North and East components
         d_north = distance_m * math.cos(rad)
         d_east  = distance_m * math.sin(rad)
 
         dlat = d_north / 111320.0
-        dlon = d_east / (111320.0 * math.cos(math.radians(self.state.lat)) + 1e-8)
+        dlon = d_east  / (111320.0 * math.cos(math.radians(self.state.lat)) + 1e-8)
 
-        new_lat = self.state.lat + dlat
-        new_lon = self.state.lon + dlon
-
-        if self._is_collision(new_lat, new_lon):
-            for delta in [15, -15, 30, -30, 45, -45]:
-                test_yaw = (self.state.yaw + delta) % 360
-                rad_t = math.radians(test_yaw)
-                dn = distance_m * math.cos(rad_t)
-                de = distance_m * math.sin(rad_t)
-                tlat = self.state.lat + dn / 111320.0
-                tlon = self.state.lon + de / (111320.0 * math.cos(math.radians(self.state.lat)) + 1e-8)
-                if not self._is_collision(tlat, tlon):
-                    self.state.yaw = test_yaw
-                    self.state.lat = tlat
-                    self.state.lon = tlon
-                    self.path.append((tlat, tlon))
-                    return
-            return
-
-        self.state.lat = new_lat
-        self.state.lon = new_lon
-        self.path.append((new_lat, new_lon))
+        self.state.lat += dlat
+        self.state.lon += dlon
+        self.path.append((self.state.lat, self.state.lon))
 
     def execute(self, cmd: MidLevelCommand):
         if cmd.action == "stop":
             return
+
         if cmd.action == "move_forward":
-            dist = cmd.value if cmd.value is not None else 20.0
-            step_size = 5.0
-            steps = max(1, int(dist / step_size))
-            actual_step = dist / steps
+            dist = cmd.value if cmd.value is not None else 30.0
+            # Move in small steps for smoother path
+            step = 8.0
+            steps = max(1, int(dist / step))
+            actual = dist / steps
             for _ in range(steps):
-                self._move_step(actual_step)
+                self._move_forward(actual)
+
         elif cmd.action == "turn_left":
-            angle = cmd.value if cmd.value is not None else 30.0
+            angle = cmd.value if cmd.value is not None else 90.0
             self.state.yaw = (self.state.yaw - angle) % 360
+
         elif cmd.action == "turn_right":
-            angle = cmd.value if cmd.value is not None else 30.0
+            angle = cmd.value if cmd.value is not None else 90.0
             self.state.yaw = (self.state.yaw + angle) % 360
 
-def create_heading_marker(lat, lon, yaw):
+# -------------------------------------------------
+# Marker
+# -------------------------------------------------
+def make_marker(lat, lon, yaw):
     html = f"""
-    <div style="transform: rotate({yaw}deg); font-size: 28px; color: #00e676;
-                text-shadow: 1px 1px 3px #000;">➤</div>
+    <div style="
+        transform: rotate({yaw}deg);
+        font-size: 28px;
+        color: #00e676;
+        text-shadow: 1px 1px 3px black;
+    ">➤</div>
     """
-    icon = folium.DivIcon(html=html, icon_size=(34, 34), icon_anchor=(17, 17))
-    return folium.Marker([lat, lon], icon=icon, popup=f"Heading: {yaw:.1f}° (0=North)")
+    icon = folium.DivIcon(html=html, icon_size=(36, 36), icon_anchor=(18, 18))
+    return folium.Marker(location=[lat, lon], icon=icon, popup=f"Yaw: {yaw:.0f}° (0=North)")
 
-# Safer open-ish start positions
+# -------------------------------------------------
+# Locations (chosen to be more open)
+# -------------------------------------------------
 LOCATIONS = {
-    "Taipei 101": (25.0336, 121.5645),
-    "National Taiwan University": (25.0175, 121.5380),
-    "Taipei Main Station": (25.0468, 121.5175),
-    "Kaohsiung": (22.6278, 120.3010),
-    "Tainan": (23.0005, 120.2275),
-    "Bangalore MG Road": (12.9755, 77.6065),
-    "Open Field (Test)": (25.0505, 121.5805),
+    "Taipei 101 (open)": (25.0340, 121.5640),
+    "NTU Campus": (25.0170, 121.5375),
+    "Taipei Main Station": (25.0475, 121.5180),
+    "Kaohsiung": (22.6275, 120.3015),
+    "Bangalore MG Road": (12.9760, 77.6060),
+    "Open Field": (25.0510, 121.5810),
 }
 
+# -------------------------------------------------
+# App
+# -------------------------------------------------
 st.set_page_config(page_title="NaVILA-Lite", page_icon="🗺️", layout="wide")
-st.title("🗺️ NaVILA-Lite – Map-based Hierarchical Navigation")
-st.caption("High-level language → Mid-level commands → Movement")
+st.title("🗺️ NaVILA-Lite (Clean Version)")
+st.caption("Focus: Correct movement direction · Fast startup · Re-executable commands")
 
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    
-    # OFF by default for speed
-    load_buildings = st.checkbox("Load real buildings (slow)", value=False,
-                                 help="Turn on only when you want building obstacles. It can take 20-60 seconds.")
-
     instruction = st.text_area(
-        "Language Instruction(s)",
-        value="Move forward 80 meters then turn left 90 degrees then move 50 meters",
+        "Instruction",
+        value="Move forward 100 meters then turn left 90 degrees then move 60 meters",
         height=90
     )
+    c1, c2 = st.columns(2)
+    exec_btn = c1.button("Execute", type="primary")
+    reset_btn = c2.button("Reset")
 
-    col1, col2 = st.columns(2)
-    execute_btn = col1.button("Execute", type="primary")
-    reset_btn = col2.button("Reset to Location")
-
-if "controller" not in st.session_state:
-    lat, lon = LOCATIONS["Taipei 101"]
-    st.session_state.controller = MapController(lat, lon, yaw=0.0)
+# Session
+if "ctrl" not in st.session_state:
+    lat, lon = LOCATIONS["Taipei 101 (open)"]
+    st.session_state.ctrl = MapController(lat, lon, yaw=0.0)
     st.session_state.planner = HybridPlanner()
     st.session_state.history = []
-    st.session_state.current_location = "Taipei 101"
+    st.session_state.loc = "Taipei 101 (open)"
 
-ctrl = st.session_state.controller
+ctrl = st.session_state.ctrl
 
-if reset_btn or location_name != st.session_state.current_location:
+if reset_btn or location_name != st.session_state.loc:
     lat, lon = LOCATIONS[location_name]
     ctrl.reset(lat, lon, yaw=0.0)
     st.session_state.history = []
-    st.session_state.current_location = location_name
+    st.session_state.loc = location_name
     st.rerun()
 
-# Only load buildings when user explicitly checks the box
-if load_buildings and HAS_OSMNX and len(ctrl.building_polys) == 0:
-    with st.spinner("Loading buildings (this can take a while)..."):
-        success = ctrl.load_buildings_around(ctrl.state.lat, ctrl.state.lon, dist=90)
-        if success:
-            st.sidebar.success(f"Loaded {len(ctrl.building_polys)} buildings")
-        else:
-            st.sidebar.warning("No buildings loaded")
-
-if execute_btn and instruction.strip():
-    commands = st.session_state.planner.parse_multiple(instruction)
-    for cmd in commands:
+if exec_btn and instruction.strip():
+    cmds = st.session_state.planner.parse_multiple(instruction)
+    for cmd in cmds:
         ctrl.execute(cmd)
-        st.session_state.history.append({"command": str(cmd), "source": cmd.source})
+        st.session_state.history.append(str(cmd))
 
 # Map
 m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=17)
-folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+folium.TileLayer("OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
-folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
 folium.TileLayer(
     tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     attr="Esri", name="Satellite"
@@ -279,34 +208,27 @@ folium.TileLayer(
 if len(ctrl.path) > 1:
     folium.PolyLine(ctrl.path, color="#1e90ff", weight=6, opacity=0.9).add_to(m)
 
-for poly in ctrl.building_polys:
-    try:
-        locations = [(lat, lon) for lon, lat in poly]
-        folium.Polygon(locations, color="#c0392b", weight=1, fill=True, fill_opacity=0.25).add_to(m)
-    except Exception:
-        pass
+folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
+make_marker(ctrl.state.lat, ctrl.state.lon, ctrl.state.yaw).add_to(m)
 
-if ctrl.path:
-    folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
+folium.LayerControl().add_to(m)
+st_folium(m, width=1000, height=600, key=f"m{len(ctrl.path)}")
 
-create_heading_marker(ctrl.state.lat, ctrl.state.lon, ctrl.state.yaw).add_to(m)
-folium.LayerControl(collapsed=False).add_to(m)
-
-st_folium(m, width=1000, height=600, key=f"map_{st.session_state.current_location}_{len(ctrl.path)}")
-
-col_a, col_b = st.columns(2)
-with col_a:
+# State
+col1, col2 = st.columns(2)
+with col1:
     st.subheader("Robot State")
-    st.metric("Latitude", f"{ctrl.state.lat:.6f}")
-    st.metric("Longitude", f"{ctrl.state.lon:.6f}")
-    st.metric("Heading (0=North)", f"{ctrl.state.yaw:.1f}°")
+    st.write(f"**Lat:** {ctrl.state.lat:.6f}")
+    st.write(f"**Lon:** {ctrl.state.lon:.6f}")
+    st.write(f"**Heading:** {ctrl.state.yaw:.1f}°  (0 = North)")
 
-with col_b:
-    st.subheader("Executed Commands")
+with col2:
+    st.subheader("Commands")
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-10:]):
-            st.markdown(f"`{h['command']}` <span style='color:gray;font-size:0.85em'>({h['source']})</span>", unsafe_allow_html=True)
+        for h in reversed(st.session_state.history[-8:]):
+            st.code(h, language=None)
     else:
-        st.info("No commands yet.")
+        st.info("No commands yet")
 
-st.caption("NaVILA-Lite · Building loading is optional (off by default) for faster testing")
+st.markdown("---")
+st.caption("NaVILA-Lite Clean · Test movement direction first")
