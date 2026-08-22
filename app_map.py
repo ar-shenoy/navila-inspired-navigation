@@ -1,12 +1,11 @@
 """
-NaVILA-Lite – Map-based Hierarchical Navigation (Improved)
+NaVILA-Lite – Map-based Hierarchical Navigation (Polished)
 
-- Multi-command language instructions
-- Long distance support
-- Hybrid high-level planner
-- Real building obstacles via OSMnx (with fallback)
-- Better robot heading visualization
-- Basic reactive obstacle avoidance
+Fixes:
+- Proper location switching
+- Dynamic building loading as robot moves
+- More map tile layers
+- Cleaner state management
 """
 
 import streamlit as st
@@ -16,9 +15,7 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-import numpy as np
 
-# Optional OSMnx for real buildings
 try:
     import osmnx as ox
     HAS_OSMNX = True
@@ -52,7 +49,7 @@ class RobotState:
 
 
 # -------------------------------------------------
-# Hybrid Planner (multi-command)
+# Planner
 # -------------------------------------------------
 class HybridPlanner:
     def __init__(self):
@@ -99,7 +96,7 @@ class HybridPlanner:
 
 
 # -------------------------------------------------
-# Map Controller
+# Controller
 # -------------------------------------------------
 class MapController:
     def __init__(self, start_lat=25.0330, start_lon=121.5654):
@@ -107,37 +104,53 @@ class MapController:
         self.path: List[Tuple[float, float]] = [(start_lat, start_lon)]
         self.obstacles: List[Tuple[float, float, float]] = []
         self.building_polys = []
+        self.last_building_center = (start_lat, start_lon)
 
     def reset(self, lat, lon, yaw=0.0):
         self.state = RobotState(lat=lat, lon=lon, yaw=yaw)
         self.path = [(lat, lon)]
         self.building_polys = []
+        self.obstacles = []
+        self.last_building_center = (lat, lon)
 
     def set_obstacles(self, obstacles):
         self.obstacles = obstacles
 
-    def load_buildings_around(self, lat, lon, dist=120):
-        self.building_polys = []
+    def load_buildings_around(self, lat, lon, dist=180):
         if not HAS_OSMNX:
             return False
         try:
             tags = {"building": True}
             gdf = ox.features_from_point((lat, lon), tags=tags, dist=dist)
+            new_polys = []
             if gdf is not None and not gdf.empty:
                 for geom in gdf.geometry:
                     if geom is None:
                         continue
                     if geom.geom_type == "Polygon":
-                        coords = list(geom.exterior.coords)
-                        self.building_polys.append(coords)
+                        new_polys.append(list(geom.exterior.coords))
                     elif geom.geom_type == "MultiPolygon":
                         for poly in geom.geoms:
-                            coords = list(poly.exterior.coords)
-                            self.building_polys.append(coords)
-            return len(self.building_polys) > 0
+                            new_polys.append(list(poly.exterior.coords))
+            # Merge with existing (simple append + limit)
+            self.building_polys.extend(new_polys)
+            # Keep only last ~120 polygons for performance
+            if len(self.building_polys) > 120:
+                self.building_polys = self.building_polys[-120:]
+            self.last_building_center = (lat, lon)
+            return len(new_polys) > 0
         except Exception as e:
-            st.warning(f"Could not load real buildings: {e}")
+            st.warning(f"Building load failed: {e}")
             return False
+
+    def maybe_reload_buildings(self, threshold_m=120):
+        """Reload buildings if robot has moved far from last load center."""
+        if not HAS_OSMNX:
+            return
+        dist = self._distance_m(self.state.lat, self.state.lon,
+                                self.last_building_center[0], self.last_building_center[1])
+        if dist > threshold_m:
+            self.load_buildings_around(self.state.lat, self.state.lon, dist=180)
 
     def _distance_m(self, lat1, lon1, lat2, lon2):
         R = 6371000
@@ -171,7 +184,6 @@ class MapController:
 
     def _move_step(self, distance_m: float):
         math_angle = math.radians(90.0 - self.state.yaw)
-
         dy = distance_m * math.sin(math_angle)
         dx = distance_m * math.cos(math_angle)
 
@@ -207,11 +219,12 @@ class MapController:
 
         if cmd.action == "move_forward":
             dist = cmd.value if cmd.value is not None else 20.0
-            step_size = 5.0
+            step_size = 6.0
             steps = max(1, int(dist / step_size))
             actual_step = dist / steps
             for _ in range(steps):
                 self._move_step(actual_step)
+                self.maybe_reload_buildings(threshold_m=100)
 
         elif cmd.action == "turn_left":
             angle = cmd.value if cmd.value is not None else 30.0
@@ -223,21 +236,16 @@ class MapController:
 
 
 def create_heading_marker(lat, lon, yaw):
-    rotation = yaw
     html = f"""
     <div style="
-        transform: rotate({rotation}deg);
-        font-size: 24px;
-        color: #00cc44;
-        text-shadow: 1px 1px 2px black;
+        transform: rotate({yaw}deg);
+        font-size: 26px;
+        color: #00e676;
+        text-shadow: 1px 1px 3px black;
     ">➤</div>
     """
-    icon = folium.DivIcon(
-        html=html,
-        icon_size=(30, 30),
-        icon_anchor=(15, 15),
-    )
-    return folium.Marker([lat, lon], icon=icon, popup=f"Yaw: {yaw:.1f}°")
+    icon = folium.DivIcon(html=html, icon_size=(32, 32), icon_anchor=(16, 16))
+    return folium.Marker([lat, lon], icon=icon, popup=f"Heading: {yaw:.1f}°")
 
 
 # -------------------------------------------------
@@ -246,11 +254,7 @@ def create_heading_marker(lat, lon, yaw):
 st.set_page_config(page_title="NaVILA-Lite Map Navigation", page_icon="🗺️", layout="wide")
 
 st.title("🗺️ NaVILA-Lite – Map-based Hierarchical Navigation")
-st.markdown("""
-**NaVILA-style hierarchical navigation on real maps**  
-High-level language → Mid-level commands → Movement + reactive obstacle avoidance  
-(Real buildings loaded via OSMnx when available)
-""")
+st.caption("High-level language → Mid-level commands → Movement + reactive avoidance (real buildings via OSMnx)")
 
 LOCATIONS = {
     "Taipei 101": (25.0330, 121.5654),
@@ -264,47 +268,49 @@ LOCATIONS = {
 
 with st.sidebar:
     st.header("Controls")
-    location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_buildings = st.checkbox("Load real buildings (OSMnx)", value=True,
-                                 help="Downloads building footprints around the start point. May take a few seconds.")
+    location_name = st.selectbox("Start Location", list(LOCATIONS.keys()), key="loc_select")
+    load_buildings = st.checkbox("Load / Update real buildings (OSMnx)", value=True)
+
     instruction = st.text_area(
         "Language Instruction(s)",
-        value="Move forward 120 meters then turn left 90 degrees then move 80 meters",
-        height=110,
-        help="Example: move 200m then turn left 90 then move 150m"
+        value="Move forward 150 meters then turn left 90 degrees then move 100 meters",
+        height=100
     )
+
     col1, col2 = st.columns(2)
     execute_btn = col1.button("Execute", type="primary")
-    reset_btn = col2.button("Reset")
+    reset_btn = col2.button("Reset to Location")
 
+# Session state init
 if "controller" not in st.session_state:
     lat, lon = LOCATIONS["Taipei 101"]
     st.session_state.controller = MapController(lat, lon)
     st.session_state.planner = HybridPlanner()
     st.session_state.history = []
-    st.session_state.buildings_loaded = False
-
-if reset_btn:
-    lat, lon = LOCATIONS[location_name]
-    st.session_state.controller.reset(lat, lon)
-    st.session_state.history = []
-    st.session_state.buildings_loaded = False
-    st.rerun()
+    st.session_state.current_location = "Taipei 101"
 
 ctrl = st.session_state.controller
 
-if load_buildings and not st.session_state.buildings_loaded and HAS_OSMNX:
-    with st.spinner("Loading real buildings from OpenStreetMap..."):
-        success = ctrl.load_buildings_around(ctrl.state.lat, ctrl.state.lon, dist=150)
-        st.session_state.buildings_loaded = True
-        if success:
-            st.sidebar.success(f"Loaded {len(ctrl.building_polys)} buildings")
-        else:
-            st.sidebar.info("No buildings loaded – using fallback")
+# Handle location change + reset
+if reset_btn or location_name != st.session_state.get("current_location", ""):
+    lat, lon = LOCATIONS[location_name]
+    ctrl.reset(lat, lon)
+    st.session_state.history = []
+    st.session_state.current_location = location_name
+    if load_buildings and HAS_OSMNX:
+        with st.spinner("Loading buildings for new location..."):
+            ctrl.load_buildings_around(lat, lon, dist=180)
+    st.rerun()
 
-elif not HAS_OSMNX:
-    st.sidebar.warning("OSMnx not installed. Install with: pip install osmnx")
+# Manual building load
+if load_buildings and HAS_OSMNX and len(ctrl.building_polys) == 0:
+    with st.spinner("Loading buildings..."):
+        ctrl.load_buildings_around(ctrl.state.lat, ctrl.state.lon, dist=180)
 
+if not HAS_OSMNX:
+    st.sidebar.warning("OSMnx not installed → pip install osmnx")
+
+# Execute commands
 if execute_btn and instruction.strip():
     commands = st.session_state.planner.parse_multiple(instruction)
     for cmd in commands:
@@ -314,58 +320,76 @@ if execute_btn and instruction.strip():
             "source": cmd.source
         })
 
+# Fallback obstacles
 if len(ctrl.building_polys) == 0 and location_name == "Taipei 101":
     ctrl.set_obstacles([
-        (25.0340, 121.5660, 20),
-        (25.0325, 121.5648, 18),
+        (25.0340, 121.5660, 18),
+        (25.0325, 121.5648, 15),
     ])
-else:
-    ctrl.set_obstacles([])
 
-m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=17, tiles="OpenStreetMap")
+# -------------------- Map --------------------
+m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=16)
 
+# More tile layers
+folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
+folium.TileLayer(
+    tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    attr="OpenTopoMap",
+    name="Topo"
+).add_to(m)
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri",
+    name="Satellite"
+).add_to(m)
 
+# Path
 if len(ctrl.path) > 1:
-    folium.PolyLine(ctrl.path, color="#0066ff", weight=6, opacity=0.85, tooltip="Path").add_to(m)
+    folium.PolyLine(ctrl.path, color="#1e90ff", weight=6, opacity=0.9).add_to(m)
 
-for poly in ctrl.building_polys[:80]:
+# Buildings
+for poly in ctrl.building_polys[-100:]:
     try:
         locations = [(lat, lon) for lon, lat in poly]
-        folium.Polygon(locations, color="#e74c3c", weight=1, fill=True, fill_opacity=0.25).add_to(m)
+        folium.Polygon(locations, color="#e74c3c", weight=1, fill=True, fill_opacity=0.3).add_to(m)
     except Exception:
         pass
 
+# Circular obstacles
 for olat, olon, rad in ctrl.obstacles:
-    folium.Circle(location=[olat, olon], radius=rad, color="red", fill=True, fill_opacity=0.3, popup="Obstacle").add_to(m)
+    folium.Circle(location=[olat, olon], radius=rad, color="red", fill=True, fill_opacity=0.35).add_to(m)
 
+# Start + Robot
 if ctrl.path:
-    folium.CircleMarker(ctrl.path[0], radius=6, color="green", fill=True, fill_color="lime", popup="Start").add_to(m)
+    folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
 
 create_heading_marker(ctrl.state.lat, ctrl.state.lon, ctrl.state.yaw).add_to(m)
 
-folium.LayerControl().add_to(m)
+folium.LayerControl(collapsed=False).add_to(m)
 
-st_folium(m, width=980, height=600)
+st_folium(m, width=1000, height=620, key="main_map")
 
+# Info
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Robot State")
     st.metric("Latitude", f"{ctrl.state.lat:.6f}")
     st.metric("Longitude", f"{ctrl.state.lon:.6f}")
-    st.metric("Yaw (heading)", f"{ctrl.state.yaw:.1f}°")
+    st.metric("Heading", f"{ctrl.state.yaw:.1f}°")
+    st.write(f"Buildings loaded: **{len(ctrl.building_polys)}**")
 
 with col_b:
     st.subheader("Executed Commands")
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-8:]):
+        for h in reversed(st.session_state.history[-10:]):
             st.markdown(
                 f"`{h['command']}`  <span style='color:gray;font-size:0.85em'>({h['source']})</span>",
                 unsafe_allow_html=True
             )
     else:
-        st.info("No commands executed yet.")
+        st.info("No commands yet.")
 
 st.markdown("---")
-st.caption("NaVILA-Lite · Hierarchical navigation on real maps · Buildings via OSMnx · Inspired by NaVILA (RSS 2025)")
+st.caption("NaVILA-Lite · Hierarchical VLA-style navigation on real maps · Inspired by NaVILA (RSS 2025)")
