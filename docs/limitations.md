@@ -1,53 +1,59 @@
 # Limitations & Practical Constraints
 
-This document honestly describes what is and is not possible with the current hardware setup.
+Honest description of what this project is and is not.
 
 ---
 
-## 1. Hardware Reality
+## 1. Hardware reality
 
-| Component              | Requirement for full NaVILA + Isaac Sim | Available in this project |
-|------------------------|-----------------------------------------|---------------------------|
-| GPU                    | Strong NVIDIA GPU (ideally ≥ 16–24 GB) | AMD Radeon 6500M / Kaggle T4 |
-| Isaac Sim              | Official NVIDIA Isaac Sim / Isaac Lab  | Not runnable on AMD       |
-| Full NaVILA weights    | Large VLM + locomotion policy          | Not loaded                |
-| Real-time control      | High-frequency locomotion loop         | Simulated / simplified    |
+| Component | Typical full NaVILA + Isaac path | This project |
+|-----------|----------------------------------|--------------|
+| GPU | Strong NVIDIA GPU | AMD laptop / limited GPU; optional Kaggle T4 |
+| Isaac Sim | Required for official stack | Not available on AMD setup |
+| Full NaVILA weights | Large VLA + locomotion policy | Not loaded |
+| Environment | Photorealistic sim + robot | Real map demo (OSM + OSRM + Streamlit) |
 
-**Conclusion:** Running the complete NaVILA stack (Isaac Sim + full model) is not feasible on the available hardware.
-
----
-
-## 2. What We Can Still Do Well
-
-Even with these constraints we can still produce a meaningful submission by focusing on:
-
-1. **Deep understanding** of the NaVILA architecture and design choices.
-2. **Clear hierarchical design** that mirrors the original paper.
-3. **Runnable high-level prototype** (language + vision → mid-level command) that works on Kaggle T4.
-4. **Honest discussion** of how the system would connect to Isaac Sim and real robots.
-5. **Clean documentation** so a reviewer can quickly see the thought process.
+**Conclusion:** The complete NaVILA + Isaac Sim pipeline was not runnable on the available machine. The project focuses on the hierarchical idea and a demonstrable map-grounded prototype instead.
 
 ---
 
-## 3. What a Full Implementation Would Require
+## 2. What works well here
 
-To run the complete pipeline one would need:
-
-- NVIDIA GPU workstation or cloud instance
-- Isaac Sim / Isaac Lab installation
-- NaVILA model weights and locomotion policies
-- Proper ROS 2 / Isaac bridge for real robot deployment
-
-This is left as future work once suitable hardware is available.
+- Clear hierarchical interface (language/landmark → mid-level → low-level)
+- Interactive demo on real city maps
+- Landmark routing via open-source OSRM
+- Instant prebaked local obstacles for reliable demos
+- Explainability and basic scoring
+- Runs on consumer hardware
 
 ---
 
-## 4. Design Decision
+## 3. Known technical limits
+
+1. **High-level planner**  
+   Default path is a strong heuristic. Optional VLM depends on network/API availability and is not a fully trained navigation VLA.
+
+2. **Live dense OSM obstacles**  
+   Continuous Overpass/OSMnx queries are slow and can timeout. That is why prebaked packs are the default and live expand is optional.
+
+3. **Collision model**  
+   Geometric building polygons, not full semantic 3D perception.
+
+4. **Long-horizon routes**  
+   Primarily follow OSRM road geometry. Local avoidance is strongest near prebaked/expanded regions.
+
+5. **Not a benchmarked VLN agent**  
+   No claim of R2R/RxR SOTA metrics in the current demo.
+
+---
+
+## 4. Design decision
 
 Given the constraints, this repository prioritizes:
 
-- Clarity of ideas over complete system execution
-- Hierarchical design fidelity to NaVILA
-- Reproducibility on free / limited compute (Kaggle)
+- hierarchical design fidelity to the NaVILA *idea*
+- a working, shareable demo
+- reproducibility on limited compute
+- honest documentation of trade-offs
 
-This approach still demonstrates the core technical understanding required for the exploration task proposed by Hucenrotia Laboratory.
+This is intended to show technical understanding and implementation seriousness for exploration / internship discussion — not to claim a full reproduction of the NaVILA system.

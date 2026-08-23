@@ -2,21 +2,22 @@
 
 **Practical hierarchical Vision-Language Navigation on real maps**
 
-A lightweight system inspired by [NaVILA (RSS 2025)](https://navila-bot.github.io/).  
-It keeps the core hierarchical idea — **high-level language → mid-level spatial commands → low-level control** — while running on limited consumer hardware (no NVIDIA Isaac Sim required).
+Inspired by [NaVILA (RSS 2025)](https://navila-bot.github.io/).  
+This project keeps the core hierarchical idea — **high-level language → mid-level spatial commands → low-level control** — while running on limited consumer hardware **without NVIDIA Isaac Sim**.
+
+> **Run this:** `streamlit run app_map_v2.py`  
+> Older files (`app.py`, `app_map.py`) are legacy experiments only.
 
 ---
 
-## Why this project exists
+## Motivation
 
-Full NaVILA-style systems typically rely on heavy simulation (e.g. Isaac Sim) and strong GPUs.  
-This prototype explores the same hierarchical interface under real constraints:
+Full NaVILA-style systems usually need Isaac Sim and strong NVIDIA GPUs.  
+This prototype was built under real constraints (AMD laptop / limited GPU, no Isaac access) to still demonstrate:
 
-- AMD / limited-GPU laptop
-- No Isaac Sim access
-- Need for a runnable, demonstrable demo
-
-The result is a **map-grounded** hierarchical navigator using OpenStreetMap, OSRM road routing, and a Streamlit interface.
+- understanding of hierarchical VLN / VLA design
+- a working end-to-end demo on **real map data**
+- honest engineering trade-offs when full sim-to-real is not available
 
 ---
 
@@ -29,52 +30,48 @@ pip install -r requirements_map.txt
 streamlit run app_map_v2.py
 ```
 
-**Main entry point:** `app_map_v2.py`
+**Suggested demo**
 
-Suggested first demo:
-
-1. Leave “Live OSM scan expand” **off** (faster)
-2. Start at **Taipei 101**
+1. Leave “Live OSM scan expand” **off** (fastest)
+2. Start location: Taipei 101
 3. Language: `Move forward 70 meters then turn left 90 degrees then move 40 meters` → **Execute Language**
 4. Landmark: `Taipei Main Station` → **Execute Landmark**
 
+Optional VLM: set `HF_TOKEN` in the environment or Streamlit secrets. The system works without it.
+
 ---
 
-## Architecture
+## Architecture (current)
 
 ```text
-Natural language instruction  OR  landmark name
+Language instruction  OR  landmark name
               │
               ▼
-┌─────────────────────────────────────┐
-│  High-level planner                 │
-│  (hybrid heuristic + optional VLM)  │
-└─────────────────────────────────────┘
-              │  mid-level commands
+┌──────────────────────────────────────┐
+│ High-level planner                   │
+│  • hybrid heuristic (default)        │
+│  • optional lightweight VLM          │
+│  • map-context summary               │
+└──────────────────────────────────────┘
+              │ mid-level commands
               ▼
-┌─────────────────────────────────────┐
-│  Low-level controller               │
-│  (reactive motion + route following)│
-└─────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│ Low-level controller                 │
+│  • heading-aware motion              │
+│  • local building avoidance          │
+│  • full OSRM waypoint following      │
+└──────────────────────────────────────┘
               │
               ▼
-┌─────────────────────────────────────┐
-│  Real map layer                     │
-│  • OSRM → road routes (purple)      │
-│  • Prebaked local buildings         │
-│  • Optional live OSM expand         │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│ Real map layer                       │
+│  • OSRM public routing (road paths)  │
+│  • prebaked local buildings          │
+│  • optional live OSM expand          │
+└──────────────────────────────────────┘
 ```
 
-### Design choices
-
-| Choice | Reason |
-|--------|--------|
-| Hierarchical commands | Same core insight as NaVILA — interpretable mid-level interface |
-| Hybrid planner | Reliable on limited hardware; VLM optional |
-| OSRM public routing | Open-source real-road paths without heavy local graphs |
-| Prebaked obstacles | Instant demo start; avoids Overpass timeouts |
-| Streamlit + Folium | Shareable interactive demo without Isaac Sim |
+More detail: [`docs/architecture.md`](docs/architecture.md)
 
 ---
 
@@ -82,63 +79,60 @@ Natural language instruction  OR  landmark name
 
 - Hierarchical NaVILA-style command flow
 - Multi-command natural language instructions
-- Landmark navigation via Nominatim + **OSRM** road routes
-- Instant **prebaked** building obstacles for listed spawn maps
-- Optional live OSM expand while moving (off by default for speed)
-- Separate execute buttons for landmark vs language
-- Movement score, collision count, explainability panel
-- Optional lightweight VLM (Hugging Face token via env / secrets)
-- Modular code under `src/`
+- Landmark navigation (Nominatim + **OSRM** real-road routes)
+- Instant **prebaked** obstacles for listed spawn maps
+- Optional live OSM expand while moving (off by default)
+- Separate Execute buttons (Landmark vs Language)
+- Movement score, collisions, explainability panel
+- Modular `src/` layout
 
 ---
 
-## Project structure
+## Repository layout
 
 ```text
-navila-inspired-navigation/
-├── app_map_v2.py                 ← Main Streamlit app
-├── requirements_map.txt
-├── data/preloaded/               ← Instant obstacle packs for demo maps
-├── src/
-│   ├── high_level/
-│   │   ├── vlm_planner.py        # Hybrid / map-context planner
-│   │   ├── geocoder.py           # Nominatim landmarks
-│   │   └── router.py             # OSRM road routing
-│   ├── low_level/
-│   │   └── osm_controller.py     # Motion, avoidance, route following
-│   └── map/
-│       ├── prebaked.py           # Instant local obstacles
-│       └── osm_loader.py         # Optional live OSM expand
-├── docs/                         # Notes and analysis
-└── notebooks/                    # Early concept experiments
+app_map_v2.py              ← main app (use this)
+requirements_map.txt
+data/preloaded/            ← instant obstacle packs
+src/
+  high_level/              ← planner, geocoder, OSRM router
+  low_level/               ← motion + avoidance + route following
+  map/                     ← prebaked + optional live OSM
+docs/                      ← architecture, limitations, future work
+notebooks/                 ← early concept experiments (not required to run the app)
 ```
 
-Legacy prototypes (`app.py`, `app_map.py`) are kept only for history; **use `app_map_v2.py`**.
+---
+
+## Limitations (honest)
+
+- Not a full trained VLA and not an Isaac Sim deployment
+- Planner is heuristic-dominant by default; VLM is optional
+- Continuous city-scale live OSM obstacle streaming is limited by public Overpass latency → addressed with prebaked packs + OSRM roads
+- Collision checks are geometric
+- Long-distance travel follows OSRM roads; dense local avoidance is strongest near prebaked/expanded regions
+
+Full write-up: [`docs/limitations.md`](docs/limitations.md)
 
 ---
 
-## Honest limitations
+## What we could do next
 
-- This is **not** a full trained VLA model and **not** an Isaac Sim deployment.
-- High-level planning is heuristic-dominant by default; VLM is optional and network-dependent.
-- Dense real-time obstacle fields over long distances are constrained by public Overpass latency — addressed with prebaked local packs + OSRM roads rather than continuous city-scale OSMnx downloads.
-- Collision checking is geometric, not full semantic scene understanding.
-- Long routes follow OSRM road geometry; local building avoidance is strongest near prebaked / expanded regions.
+Documented roadmap (not claimed as done):
 
-These limits are deliberate trade-offs so the system stays **runnable, explainable, and demonstrable** on consumer hardware.
+1. **Stronger structured command generation** — constrained JSON / better prompts so optional VLM outputs are more reliable  
+2. **Simple evaluation harness** — success rate, path efficiency, collision rate on fixed start→goal pairs  
+3. **Shareable demo host** — e.g. Hugging Face Spaces  
+4. **Richer local perception** — only if compute allows (small open VLMs, better map context)  
+5. **Bridge to full sim** — Isaac Sim / Habitat-style stack when NVIDIA GPU access is available  
+6. **Optional fine-tuning path** — small open VLM on navigation-style instruction data (research direction)
 
----
-
-## Future work
-
-- Stronger local / instruction-tuned VLM with map context
-- Richer evaluation (success rate, path efficiency, collision rate)
-- Bridge toward Isaac Sim or real robot low-level control when hardware allows
+Details: [`docs/future_work.md`](docs/future_work.md)
 
 ---
 
-## Citation / inspiration
+## Inspiration
 
 Cheng et al., *NaVILA: Legged Robot Vision-Language-Action Model for Navigation*, RSS 2025.
 
-This project is an independent practical exploration of hierarchical VLN ideas under hardware constraints, not an official NaVILA implementation.
+This repository is an independent practical exploration of hierarchical VLN ideas under hardware constraints, not an official NaVILA implementation.
