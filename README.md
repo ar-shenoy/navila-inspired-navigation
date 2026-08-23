@@ -2,43 +2,8 @@
 
 **Practical Hierarchical Vision-Language Navigation on Real Maps**
 
-A modular, hierarchical navigation system inspired by [NaVILA (RSS 2025)](https://navila-bot.github.io/).  
-It keeps the core idea of separating high-level language reasoning from low-level control, while adding real-world map semantics and making the system runnable on limited hardware.
-
----
-
-## Key Idea
-
-NaVILA showed that mid-level spatial commands are an effective interface between vision-language models and low-level controllers.  
-NaVILA-Lite applies the same hierarchical principle in a practical outdoor setting:
-
-```text
-Natural Language / Landmark
-          ↓
-High-Level Planner (Hybrid / Map-Context)
-          ↓  mid-level commands
-Low-Level Controller (Reactive + optional A*)
-          ↓
-Real Map (OpenStreetMap)
-  - building=*  → obstacles
-  - highway=*   → preferred paths
-```
-
----
-
-## Features
-
-- Hierarchical NaVILA-style architecture
-- Multi-command natural language instructions
-- Landmark navigation (Nominatim geocoding)
-- Optional A* road-graph following
-- OpenStreetMap integration:
-  - Buildings as hard obstacles
-  - Roads as preferred traversable paths
-- Dynamic map data loading with caching
-- Explainability panel (shows why actions were taken)
-- Multiple map layers
-- Modular codebase (`src/`)
+Inspired by [NaVILA (RSS 2025)](https://navila-bot.github.io/).  
+This project implements a hierarchical navigation system (High-level language → mid-level commands → low-level control) that runs on limited hardware and uses real OpenStreetMap data.
 
 ---
 
@@ -51,11 +16,44 @@ pip install -r requirements_map.txt
 streamlit run app_map_v2.py
 ```
 
-**Recommended first run:**
-1. Leave “Load OSM” unchecked
+> **Main entry point:** `app_map_v2.py`  
+> (Older experimental versions: `app_map.py`, `app.py`)
+
+**First run recommendation:**
+1. Leave “Load OSM” unchecked for fast testing
 2. Click Reset
-3. Enter a multi-command instruction and press Execute
-4. Later enable OSM for buildings + roads + A*
+3. Enter: `Move forward 60 meters then turn left 90 degrees then move 40 meters`
+4. Press Execute
+
+---
+
+## Architecture
+
+```text
+Natural Language / Landmark
+          ↓
+High-Level Planner (Hybrid heuristic + optional VLM)
+          ↓  mid-level commands
+Low-Level Controller (Reactive + optional A*)
+          ↓
+OpenStreetMap Environment
+  - building=*  → obstacles
+  - highway=*   → preferred paths
+```
+
+---
+
+## Features
+
+- Hierarchical NaVILA-style design
+- Multi-command natural language instructions
+- Landmark navigation (Nominatim)
+- Optional A* road following
+- OSM buildings as obstacles / roads as preferred paths
+- Movement quality score
+- Explainability panel
+- Optional lightweight VLM (Hugging Face Inference API)
+- Modular codebase under `src/`
 
 ---
 
@@ -63,15 +61,16 @@ streamlit run app_map_v2.py
 
 ```text
 navila-inspired-navigation/
-├── app_map_v2.py                  # Main Streamlit application
+├── app_map_v2.py                 ← Main Streamlit app (use this)
+├── app_map.py                    ← Older version
 ├── src/
 │   ├── high_level/
-│   │   ├── vlm_planner.py         # Hybrid / Map-Context planner
-│   │   └── geocoder.py            # Nominatim landmark lookup
+│   │   ├── vlm_planner.py
+│   │   └── geocoder.py
 │   ├── low_level/
-│   │   └── osm_controller.py      # Movement + A* + collision
+│   │   └── osm_controller.py
 │   └── map/
-│       └── osm_loader.py          # Buildings + road graph loader
+│       └── osm_loader.py
 ├── requirements_map.txt
 └── README.md
 ```
@@ -80,39 +79,33 @@ navila-inspired-navigation/
 
 ## Design Decisions
 
-| Decision                        | Reason |
-|--------------------------------|--------|
-| Hierarchical commands          | Core NaVILA insight – interpretable & modular |
-| Hybrid planner                 | Reliability on limited hardware |
-| OSM semantic layers            | Real buildings vs roads instead of synthetic obstacles |
-| Optional A*                    | Better path quality when road graph is available |
-| Explainability panel           | Makes the system inspectable and demo-friendly |
-| Modular `src/` structure       | Easier to extend toward real VLM or Isaac Sim |
+| Decision | Reason |
+|----------|--------|
+| Hierarchical commands | Core insight from NaVILA |
+| Hybrid planner | Reliability on limited hardware |
+| OSM semantic layers | Real buildings vs roads |
+| Optional A* | Better paths when road graph is available |
+| Explainability panel | Makes the system inspectable |
+| Modular `src/` | Easier to extend |
 
 ---
 
 ## Limitations (Honest)
 
-- High-level planner is currently heuristic-dominant for stability. A lightweight VLM can be added later.
+- High-level planner is heuristic-dominant by default for stability. VLM is optional.
 - Public Overpass API can timeout; OSM loading is optional.
 - A* depends on successful road-graph download.
-- Collision checking is geometric, not full semantic scene understanding.
-- This is a research-oriented prototype focused on hierarchical design and real-map demonstration, not a full trained VLA model.
+- Collision checking is geometric.
+- This is a research-oriented prototype focused on hierarchical design and real-map demonstration.
 
 ---
 
 ## Future Work
 
-- Plug in a small instruction-tuned VLM with map-context prompting
-- Stronger road-following bias / lane-level behavior
+- Stronger instruction-tuned VLM with map context
+- Improved road-following behavior
 - Trajectory evaluation metrics
-- Bridge to Isaac Sim / real robot deployment
-
----
-
-## Relation to NaVILA
-
-This project intentionally keeps the hierarchical structure proposed by NaVILA while exploring how far the idea can go with real outdoor maps and constrained compute. It is designed as a clear, runnable stepping stone rather than a full reproduction of the original system.
+- Path toward Isaac Sim / real robots
 
 ---
 
