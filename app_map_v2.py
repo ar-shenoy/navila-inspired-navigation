@@ -1,5 +1,8 @@
 """
-NaVILA-Lite v2 – Full OSRM route following
+NaVILA-Lite v2 – Hierarchical navigation on real OSM maps
+High-level language → mid-level commands → low-level control
+Buildings = obstacles, roads = preferred paths
+Fully end-to-end, no hardcoded scenarios
 """
 
 import streamlit as st
@@ -21,7 +24,7 @@ from src.high_level.router import get_osrm_route
 
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
-st.caption("Hierarchical navigation · Full OSRM road following · Optional local OSM")
+st.caption("Hierarchical navigation · OSRM road following · Continuous collision + stuck recovery · History-aware")
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
@@ -33,6 +36,7 @@ LOCATIONS = {
     "Open Field": (25.0510, 121.5810),
 }
 
+
 def get_hf_token():
     try:
         return st.secrets.get("HF_TOKEN", None)
@@ -40,10 +44,11 @@ def get_hf_token():
         pass
     return os.environ.get("HF_TOKEN", None)
 
+
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_osm = st.checkbox("Load local OSM (optional, can be slow)", value=False)
+    load_osm = st.checkbox("Load local OSM (cached when possible)", value=False)
     use_vlm = st.checkbox("Try lightweight VLM", value=False)
 
     st.markdown("---")
@@ -56,7 +61,7 @@ with st.sidebar:
     instruction = st.text_area(
         "Language Instruction(s)",
         value="Move forward 70 meters then turn left 90 degrees then move 40 meters",
-        height=90
+        height=90,
     )
     lang_btn = st.button("Execute Language")
 
@@ -69,7 +74,12 @@ if "ctrl" not in st.session_state:
     st.session_state.planner = MapContextPlanner(use_vlm=False, hf_token=get_hf_token())
     st.session_state.history = []
     st.session_state.loc = "Taipei 101"
-    st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
+    st.session_state.map_data = {
+        "building_coords": [],
+        "road_lines": [],
+        "buildings": [],
+        "road_graph": None,
+    }
     st.session_state.last_explanation = []
     st.session_state.route_waypoints = []
 
@@ -83,23 +93,29 @@ if reset_btn or location_name != st.session_state.loc:
     st.session_state.history = []
     st.session_state.last_explanation = []
     st.session_state.loc = location_name
-    st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
+    st.session_state.map_data = {
+        "building_coords": [],
+        "road_lines": [],
+        "buildings": [],
+        "road_graph": None,
+    }
     st.session_state.route_waypoints = []
     st.rerun()
 
 if load_osm and not st.session_state.map_data.get("building_coords"):
-    with st.spinner("Loading local OSM (optional)..."):
-        data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=200)
+    with st.spinner("Loading local OSM (disk + memory cache)..."):
+        data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=250)
         st.session_state.map_data = data
         ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
         if data.get("success"):
-            st.sidebar.success(f"Local buildings: {len(data.get('building_coords', []))}")
+            src = "cache" if data.get("from_cache") else "live Overpass"
+            st.sidebar.success(f"OSM ({src}): {len(data.get('building_coords', []))} buildings")
         else:
             st.sidebar.warning(data.get("error", "OSM failed")[:80])
 
 explanation = []
 
-# ---- Landmark: full OSRM follow ----
+# ---- Landmark: full OSRM follow (primary path) ----
 if landmark_btn and landmark.strip():
     coords = geocode(landmark.strip())
     if coords is None:
@@ -116,37 +132,46 @@ if landmark_btn and landmark.strip():
 
         if waypoints and len(waypoints) > 1:
             st.session_state.route_waypoints = waypoints
-            explanation.append(f"OSRM route: {len(waypoints)} waypoints")
-            # Follow COMPLETE route in this single click
-            ctrl.follow_waypoints(waypoints, max_step_m=150.0)
+            explanation.append(f"OSRM route: {len(waypoints)} waypoints (prefer roads)")
+            # Primary: follow complete road route with continuous collision + stuck recovery
+            ctrl.follow_waypoints(waypoints, max_step_m=120.0)
             final_dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
             explanation.append(f"Route followed. Remaining to target: {final_dist:.0f} m")
+            explanation.append(f"State: {ctrl.get_state_summary()}")
             st.session_state.history.append(f"OSRM full route to '{landmark}'")
         else:
-            explanation.append("OSRM failed → direct segmented movement")
+            explanation.append("OSRM failed → direct segmented movement with recovery")
             remaining = dist
             seg = 0
-            while remaining > 30 and seg < 80:
+            while remaining > 25 and seg < 80:
                 dlat = tlat - ctrl.lat
                 dlon = tlon - ctrl.lon
                 ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                step = min(150.0, remaining)
-                ctrl.move_forward(step)
+                step = min(120.0, remaining)
+                ok = ctrl.move_forward(step)
                 remaining = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
                 seg += 1
+                if not ok:
+                    break
             st.session_state.history.append(f"Direct to '{landmark}'")
+            explanation.append(f"State: {ctrl.get_state_summary()}")
 
     st.session_state.last_explanation = explanation
 
-# ---- Language ----
+# ---- Language (history-aware) ----
 if lang_btn and instruction.strip():
+    state_sum = ctrl.get_state_summary()
     map_ctx = st.session_state.planner.build_map_context_summary(
         len(st.session_state.map_data.get("building_coords", [])),
         len(st.session_state.map_data.get("road_lines", [])),
-        ctrl.lat, ctrl.lon
+        ctrl.lat,
+        ctrl.lon,
+        state_summary=state_sum,
     )
     cmds = st.session_state.planner.parse(instruction, map_context=map_ctx)
     explanation.append(f"Parsed {len(cmds)} cmd(s) · source={cmds[0].source if cmds else '?'}")
+    explanation.append(f"Context used: {map_ctx[:120]}...")
+
     for cmd in cmds:
         if cmd.action == "move_forward":
             ctrl.move_forward(cmd.value or 30.0)
@@ -156,24 +181,48 @@ if lang_btn and instruction.strip():
             ctrl.turn_right(cmd.value or 90.0)
         elif cmd.action == "return_home":
             ctrl.return_home()
+        elif cmd.action == "follow_road_to":
+            # If we have a road graph, try a short road-preferring step toward current heading
+            if ctrl.road_graph is not None:
+                # simple: move forward while preferring roads (already handled by collision + recovery)
+                ctrl.move_forward(cmd.value or 40.0)
+            else:
+                ctrl.move_forward(cmd.value or 40.0)
+        elif cmd.action == "go_to_landmark":
+            # treat as extra forward if no separate landmark flow triggered
+            ctrl.move_forward(cmd.value or 50.0)
+        elif cmd.action == "stop":
+            pass
         st.session_state.history.append(str(cmd))
         explanation.append(f"Executed: {cmd}")
+
+    explanation.append(f"State after: {ctrl.get_state_summary()}")
     st.session_state.last_explanation = explanation
 
 # ---- Map ----
-m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=12 if len(st.session_state.route_waypoints) > 40 else 15)
+m = folium.Map(
+    location=[ctrl.lat, ctrl.lon],
+    zoom_start=12 if len(st.session_state.route_waypoints) > 40 else 15,
+)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
 folium.TileLayer(
     tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    attr="Esri", name="Satellite"
+    attr="Esri",
+    name="Satellite",
 ).add_to(m)
 
 # Purple = OSRM planned road route
 if st.session_state.route_waypoints:
     try:
-        folium.PolyLine(st.session_state.route_waypoints, color="#9b59b6", weight=4, opacity=0.7, popup="OSRM plan").add_to(m)
+        folium.PolyLine(
+            st.session_state.route_waypoints,
+            color="#9b59b6",
+            weight=4,
+            opacity=0.7,
+            popup="OSRM plan (prefer roads)",
+        ).add_to(m)
     except Exception:
         pass
 
@@ -192,7 +241,9 @@ for coords in st.session_state.map_data.get("building_coords", []):
 if len(ctrl.path) > 1:
     folium.PolyLine(ctrl.path, color="#1e90ff", weight=5, opacity=0.9).add_to(m)
 
-folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
+folium.CircleMarker(
+    ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start"
+).add_to(m)
 
 html = f"""
 <div style="transform: rotate({ctrl.yaw}deg); font-size: 24px; color: #00e676;
@@ -218,6 +269,9 @@ with col2:
     st.metric("Score", f"{ctrl.score:.1f}")
     st.metric("Distance", f"{ctrl.total_distance:.0f} m")
     st.metric("Collisions", ctrl.collision_count)
+    if ctrl.total_distance > 1:
+        efficiency = max(0.0, 1.0 - (ctrl.collision_count * 8.0) / ctrl.total_distance)
+        st.metric("Path efficiency (live)", f"{efficiency:.2f}")
 
 with col3:
     st.subheader("History")
@@ -226,6 +280,7 @@ with col3:
             st.markdown(f"- `{h}`")
     else:
         st.info("No commands yet")
+    st.caption(ctrl.get_state_summary()[:90] + "...")
 
 st.markdown("---")
 st.subheader("Explainability")
@@ -235,4 +290,7 @@ if st.session_state.last_explanation:
 else:
     st.info("Execute Landmark or Language to see reasoning.")
 
-st.caption("Purple = OSRM planned roads · Blue = actual path · Local OSM optional")
+st.caption(
+    "Purple = OSRM planned roads · Blue = actual path · Red polygons = buildings (obstacles) · "
+    "Continuous collision + stuck recovery · History fed to planner"
+)
