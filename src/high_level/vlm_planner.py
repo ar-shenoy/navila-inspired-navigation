@@ -2,8 +2,7 @@
 Map-Context Hybrid Planner with optional lightweight VLM.
 
 Primary path: robust heuristic (always works)
-Optional path: Hugging Face Inference API (Phi-3 / similar) with rich dynamic map + history context
-Fully end-to-end — no hardcoded scenarios.
+Optional path: Hugging Face Inference API (Phi-3 / similar) with rich dynamic map + history context.
 """
 
 from typing import List, Optional
