@@ -1,11 +1,6 @@
 """
-NaVILA-Lite – Map Navigation with Roads vs Buildings
-
-- Buildings (building=*) = hard obstacles
-- Roads (highway=*) = preferred traversable paths (visualized)
-- Hierarchical multi-command planner
-- Dynamic loading while moving
-- Return command support
+NaVILA-Lite – Robust version
+Handles Overpass API timeouts gracefully.
 """
 
 import streamlit as st
@@ -20,6 +15,9 @@ import random
 try:
     import osmnx as ox
     HAS_OSMNX = True
+    # Make OSMnx less aggressive on timeouts
+    ox.settings.timeout = 60
+    ox.settings.overpass_rate_limit = True
 except ImportError:
     HAS_OSMNX = False
 
@@ -44,7 +42,7 @@ class MidLevelCommand:
 class RobotState:
     lat: float
     lon: float
-    yaw: float = 0.0  # 0=North, 90=East
+    yaw: float = 0.0
 
 class HybridPlanner:
     def __init__(self):
@@ -92,7 +90,7 @@ class MapController:
         self.start_lon = lon
         self.path = [(lat, lon)]
         self.building_polys = []
-        self.road_lines = []          # list of list of (lat, lon)
+        self.road_lines = []
         self.last_center = (lat, lon)
 
     def reset(self, lat, lon, yaw=0.0):
@@ -104,14 +102,13 @@ class MapController:
         self.road_lines = []
         self.last_center = (lat, lon)
 
-    def load_osm_data(self, lat, lon, dist=100):
-        """Load buildings (obstacles) and roads (preferred) separately."""
+    def load_osm_data(self, lat, lon, dist=80):
         if not HAS_OSMNX:
             return False, False
         buildings_ok = False
         roads_ok = False
         try:
-            # Buildings = obstacles
+            # Buildings
             bldg = ox.features_from_point((lat, lon), tags={"building": True}, dist=dist)
             polys = []
             if bldg is not None and not bldg.empty:
@@ -122,10 +119,13 @@ class MapController:
                     elif geom.geom_type == "MultiPolygon":
                         for p in geom.geoms:
                             polys.append(list(p.exterior.coords))
-            self.building_polys = (self.building_polys + polys)[-50:]
+            self.building_polys = (self.building_polys + polys)[-40:]
             buildings_ok = len(polys) > 0
+        except Exception as e:
+            st.sidebar.warning(f"Buildings load failed: {str(e)[:80]}")
 
-            # Roads = preferred paths (highway=*)
+        try:
+            # Roads
             roads = ox.features_from_point((lat, lon), tags={"highway": True}, dist=dist)
             lines = []
             if roads is not None and not roads.empty:
@@ -138,19 +138,18 @@ class MapController:
                         for line in geom.geoms:
                             coords = [(lat, lon) for lon, lat in line.coords]
                             lines.append(coords)
-            self.road_lines = (self.road_lines + lines)[-80:]
+            self.road_lines = (self.road_lines + lines)[-60:]
             roads_ok = len(lines) > 0
-
-            self.last_center = (lat, lon)
-            return buildings_ok, roads_ok
         except Exception as e:
-            st.warning(f"OSM load issue: {e}")
-            return False, False
+            st.sidebar.warning(f"Roads load failed: {str(e)[:80]}")
 
-    def maybe_reload(self, threshold_m=85):
+        self.last_center = (lat, lon)
+        return buildings_ok, roads_ok
+
+    def maybe_reload(self, threshold_m=90):
         dist = self._distance_m(self.state.lat, self.state.lon, self.last_center[0], self.last_center[1])
         if dist > threshold_m and HAS_OSMNX:
-            self.load_osm_data(self.state.lat, self.state.lon, dist=100)
+            self.load_osm_data(self.state.lat, self.state.lon, dist=80)
 
     def _distance_m(self, lat1, lon1, lat2, lon2):
         R = 6371000.0
@@ -179,12 +178,12 @@ class MapController:
                 return True
         return False
 
-    def find_safe_spawn(self, lat, lon, max_tries=30):
+    def find_safe_spawn(self, lat, lon, max_tries=25):
         if not self.is_collision(lat, lon):
             return lat, lon
         for _ in range(max_tries):
-            dlat = random.uniform(-0.0004, 0.0004)
-            dlon = random.uniform(-0.0004, 0.0004)
+            dlat = random.uniform(-0.00035, 0.00035)
+            dlon = random.uniform(-0.00035, 0.00035)
             nlat, nlon = lat + dlat, lon + dlon
             if not self.is_collision(nlat, nlon):
                 return nlat, nlon
@@ -236,7 +235,6 @@ class MapController:
             actual = dist / steps
             for _ in range(steps):
                 self._move_step(actual)
-                self.maybe_reload()
             return
 
         if cmd.action == "move_forward":
@@ -246,7 +244,6 @@ class MapController:
             actual = dist / steps
             for _ in range(steps):
                 self._move_step(actual)
-                self.maybe_reload()
 
         elif cmd.action == "turn_left":
             angle = cmd.value if cmd.value is not None else 90.0
@@ -270,7 +267,7 @@ def create_robot_marker(lat, lon, yaw):
     ">▲</div>
     """
     icon = folium.DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
-    return folium.Marker([lat, lon], icon=icon, popup=f"Robot | {yaw:.0f}° (0=North)")
+    return folium.Marker([lat, lon], icon=icon, popup=f"Robot | {yaw:.0f}°")
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
@@ -283,18 +280,18 @@ LOCATIONS = {
 }
 
 st.set_page_config(page_title="NaVILA-Lite", page_icon="🗺️", layout="wide")
-st.title("🗺️ NaVILA-Lite – Roads vs Buildings")
-st.caption("Buildings = obstacles · Roads = preferred paths · Hierarchical commands")
+st.title("🗺️ NaVILA-Lite")
+st.caption("Hierarchical navigation · Buildings as obstacles · Roads visualized · Timeout-safe OSM")
 
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
     load_osm = st.checkbox("Load OSM (buildings + roads)", value=False,
-                           help="Loads building=* as obstacles and highway=* as roads")
+                           help="Can be slow or timeout. Leave off for fast testing.")
     instruction = st.text_area(
         "Language Instruction(s)",
         value="Move forward 80 meters then turn left 90 degrees then move 50 meters",
-        height=100
+        height=90
     )
     c1, c2 = st.columns(2)
     exec_btn = c1.button("Execute", type="primary")
@@ -314,20 +311,18 @@ if reset_btn or location_name != st.session_state.current_location:
     ctrl.reset(lat, lon)
     st.session_state.history = []
     st.session_state.current_location = location_name
-    if load_osm and HAS_OSMNX:
-        with st.spinner("Loading buildings + roads..."):
-            ctrl.load_osm_data(lat, lon, dist=100)
-            safe_lat, safe_lon = ctrl.find_safe_spawn(lat, lon)
-            ctrl.reset(safe_lat, safe_lon)
     st.rerun()
 
 if load_osm and HAS_OSMNX and len(ctrl.building_polys) == 0 and len(ctrl.road_lines) == 0:
-    with st.spinner("Loading OSM data (buildings + roads)..."):
-        b_ok, r_ok = ctrl.load_osm_data(ctrl.state.lat, ctrl.state.lon, dist=100)
+    with st.spinner("Trying to load OSM data (may timeout)..."):
+        b_ok, r_ok = ctrl.load_osm_data(ctrl.state.lat, ctrl.state.lon, dist=70)
         safe_lat, safe_lon = ctrl.find_safe_spawn(ctrl.state.lat, ctrl.state.lon)
         if (safe_lat, safe_lon) != (ctrl.state.lat, ctrl.state.lon):
             ctrl.reset(safe_lat, safe_lon)
-        st.sidebar.success(f"Buildings: {len(ctrl.building_polys)} | Roads: {len(ctrl.road_lines)}")
+        if b_ok or r_ok:
+            st.sidebar.success(f"Buildings: {len(ctrl.building_polys)} | Roads: {len(ctrl.road_lines)}")
+        else:
+            st.sidebar.warning("OSM load failed or timed out. Continuing without it.")
 
 if exec_btn and instruction.strip():
     cmds = st.session_state.planner.parse_multiple(instruction)
@@ -335,7 +330,6 @@ if exec_btn and instruction.strip():
         ctrl.execute(cmd)
         st.session_state.history.append({"command": str(cmd), "source": cmd.source})
 
-# Map
 m = folium.Map(location=[ctrl.state.lat, ctrl.state.lon], zoom_start=17)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
@@ -345,14 +339,12 @@ folium.TileLayer(
     attr="Esri", name="Satellite"
 ).add_to(m)
 
-# Draw roads first (underneath)
 for line in ctrl.road_lines:
     try:
-        folium.PolyLine(line, color="#f1c40f", weight=3, opacity=0.7, tooltip="Road").add_to(m)
+        folium.PolyLine(line, color="#f1c40f", weight=3, opacity=0.7).add_to(m)
     except Exception:
         pass
 
-# Buildings as obstacles
 for poly in ctrl.building_polys:
     try:
         locs = [(lat, lon) for lon, lat in poly]
@@ -364,35 +356,28 @@ if len(ctrl.path) > 1:
     folium.PolyLine(ctrl.path, color="#1e90ff", weight=6, opacity=0.9).add_to(m)
 
 if ctrl.path:
-    folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
+    folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime").add_to(m)
 
 create_robot_marker(ctrl.state.lat, ctrl.state.lon, ctrl.state.yaw).add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
 
-st_folium(m, width=1000, height=620, key=f"map_{len(ctrl.path)}")
+st_folium(m, width=1000, height=600, key=f"map_{len(ctrl.path)}")
 
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Robot State")
     st.metric("Latitude", f"{ctrl.state.lat:.6f}")
     st.metric("Longitude", f"{ctrl.state.lon:.6f}")
-    st.metric("Heading (0=North)", f"{ctrl.state.yaw:.1f}°")
-    st.write(f"Buildings: **{len(ctrl.building_polys)}** | Roads: **{len(ctrl.road_lines)}**")
+    st.metric("Heading", f"{ctrl.state.yaw:.1f}°")
+    st.write(f"Buildings: {len(ctrl.building_polys)} | Roads: {len(ctrl.road_lines)}")
 
 with col2:
-    st.subheader("Executed Commands")
+    st.subheader("Commands")
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-10:]):
-            st.markdown(f"`{h['command']}` <span style='color:gray;font-size:0.85em'>({h['source']})</span>", unsafe_allow_html=True)
+        for h in reversed(st.session_state.history[-8:]):
+            st.markdown(f"`{h['command']}`")
     else:
         st.info("No commands yet")
 
 st.markdown("---")
-st.markdown("""
-**How OSM is used**
-- `building=*` → treated as hard obstacles (red polygons)
-- `highway=*` → shown as preferred roads (yellow lines)
-- Robot avoids buildings and can move more freely on/near roads
-- Hierarchical NaVILA-style command structure
-""")
-st.caption("NaVILA-Lite · Roads vs Buildings · Inspired by NaVILA (RSS 2025)")
+st.caption("If OSM times out, just leave the checkbox off. Core movement still works.")
