@@ -1,10 +1,3 @@
-"""
-AI-powered High-Level Planner
-
-Improved language understanding for mid-level command generation.
-Structured so a real small VLM can be plugged in later.
-"""
-
 from dataclasses import dataclass
 from typing import Optional
 import re
