@@ -2,7 +2,8 @@
 Map-Context Hybrid Planner with optional lightweight VLM.
 
 Primary path: robust heuristic (always works)
-Optional path: Hugging Face Inference API (Phi-3 / similar) with map context
+Optional path: Hugging Face Inference API (Phi-3 / similar) with rich dynamic map + history context
+Fully end-to-end — no hardcoded scenarios.
 """
 
 from typing import List, Optional
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 import re
 import json
 import os
+
 
 @dataclass
 class MidLevelCommand:
@@ -22,6 +24,10 @@ class MidLevelCommand:
             return "stop"
         if self.action == "return_home":
             return "return to start"
+        if self.action == "go_to_landmark":
+            return f"go_to_landmark {self.value}" if self.value is not None else "go_to_landmark"
+        if self.action == "follow_road_to":
+            return "follow_road_to target"
         if self.value is not None:
             if "turn" in self.action:
                 return f"{self.action.replace('_', ' ')} {self.value:.0f}°"
@@ -66,46 +72,69 @@ class MapContextPlanner:
         parts = [p.strip() for p in parts if p.strip()]
         commands = []
         for part in parts:
-            if any(w in part for w in self.forward_words + self.left_words + self.right_words +
-                                     self.stop_words + self.return_words):
+            if any(
+                w in part
+                for w in self.forward_words
+                + self.left_words
+                + self.right_words
+                + self.stop_words
+                + self.return_words
+            ):
                 commands.append(self._heuristic_parse_single(part))
         if not commands:
             commands.append(self._heuristic_parse_single(instruction))
         return commands
 
     def _try_vlm(self, instruction: str, map_context: str) -> Optional[List[MidLevelCommand]]:
-        """Optional lightweight VLM call via HF Inference API."""
+        """Optional lightweight VLM call via HF Inference API with richer context."""
         if not self.use_vlm or not self.hf_token:
             return None
         try:
             import requests
+
             prompt = (
-                "You are a robot navigation planner. "
-                "Given the map context and the human instruction, "
-                "output ONLY a JSON list of commands. "
-                "Allowed actions: move_forward (meters), turn_left (degrees), "
-                "turn_right (degrees), stop, return_home.\n\n"
-                f"Map context: {map_context}\n"
+                "You are a robot navigation planner for outdoor maps. "
+                "Buildings are obstacles. Prefer roads. "
+                "Given the dynamic map + robot state context and the human instruction, "
+                "output ONLY a JSON list of mid-level commands. "
+                "Allowed actions: "
+                "move_forward (meters), turn_left (degrees), turn_right (degrees), "
+                "stop, return_home, follow_road_to, go_to_landmark.\n\n"
+                "Examples:\n"
+                '[{"action": "move_forward", "value": 50}, {"action": "turn_left", "value": 90}]\n'
+                '[{"action": "follow_road_to"}]\n'
+                f"Map + state context: {map_context}\n"
                 f"Instruction: {instruction}\n\n"
                 "JSON:"
             )
             API_URL = "https://api-inference.huggingface.co/models/microsoft/Phi-3-mini-4k-instruct"
             headers = {"Authorization": f"Bearer {self.hf_token}"}
-            payload = {"inputs": prompt, "parameters": {"max_new_tokens": 120, "return_full_text": False}}
+            payload = {
+                "inputs": prompt,
+                "parameters": {"max_new_tokens": 160, "return_full_text": False},
+            }
             r = requests.post(API_URL, headers=headers, json=payload, timeout=15)
             if r.status_code != 200:
                 return None
             text = r.json()[0]["generated_text"] if isinstance(r.json(), list) else str(r.json())
-            # Extract JSON array
             match = re.search(r"\[.*\]", text, re.DOTALL)
             if not match:
                 return None
             data = json.loads(match.group(0))
+            allowed = {
+                "move_forward",
+                "turn_left",
+                "turn_right",
+                "stop",
+                "return_home",
+                "follow_road_to",
+                "go_to_landmark",
+            }
             commands = []
             for item in data:
-                action = item.get("action", "").lower()
+                action = str(item.get("action", "")).lower()
                 value = item.get("value", None)
-                if action in ["move_forward", "turn_left", "turn_right", "stop", "return_home"]:
+                if action in allowed:
                     commands.append(MidLevelCommand(action, value, source="vlm"))
             return commands if commands else None
         except Exception:
@@ -113,18 +142,26 @@ class MapContextPlanner:
 
     def parse(self, instruction: str, map_context: Optional[str] = None) -> List[MidLevelCommand]:
         map_context = map_context or "No detailed map context available."
-        # Try VLM first if enabled
         if self.use_vlm:
             vlm_result = self._try_vlm(instruction, map_context)
             if vlm_result:
                 return vlm_result
-        # Always fall back to heuristic
         return self._heuristic_parse(instruction)
 
-    def build_map_context_summary(self, num_buildings: int, num_roads: int,
-                                  lat: float, lon: float) -> str:
-        return (
+    def build_map_context_summary(
+        self,
+        num_buildings: int,
+        num_roads: int,
+        lat: float,
+        lon: float,
+        state_summary: Optional[str] = None,
+    ) -> str:
+        """Fully dynamic context (position, obstacles, roads, recent history)."""
+        base = (
             f"Robot at ({lat:.5f}, {lon:.5f}). "
             f"Nearby: {num_buildings} buildings (obstacles), {num_roads} road segments. "
             f"Prefer roads, avoid buildings."
         )
+        if state_summary:
+            return base + " State: " + state_summary
+        return base
