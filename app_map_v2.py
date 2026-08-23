@@ -1,7 +1,7 @@
 """
 NaVILA-Lite v2 – Hierarchical navigation on real maps
 Instant prebaked obstacles for listed spawns (no wait on open).
-Live OSM expands <100m around the robot as it moves (scan-style).
+Optional live OSM expand <100m (off by default for speed).
 """
 
 import streamlit as st
@@ -25,7 +25,7 @@ from src.high_level.router import get_osrm_route
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
 st.caption(
-    "Instant prebaked obstacles · Live scan expand <100m · OSRM roads · Hierarchical commands"
+    "Instant prebaked obstacles · Fast traversal · OSRM roads · Hierarchical commands"
 )
 
 LOCATIONS = {
@@ -48,7 +48,6 @@ def get_hf_token():
 
 
 def load_instant_map(location_name: str, ctrl: OSMController):
-    """Zero-wait obstacles for the selected spawn."""
     data = get_prebaked(location_name)
     st.session_state.map_data = data
     ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
@@ -62,11 +61,6 @@ def load_instant_map(location_name: str, ctrl: OSMController):
 
 
 def maybe_scan_expand(ctrl: OSMController):
-    """
-    After movement: if near edge of known map, fetch one <100m live tile
-    centered on the robot (scan device style). Never blocks startup.
-    Failures are silent — prebaked obstacles remain.
-    """
     md = st.session_state.map_data
     if not needs_expansion(md, ctrl.lat, ctrl.lon):
         return
@@ -74,11 +68,6 @@ def maybe_scan_expand(ctrl: OSMController):
         new_md = expand_around(md, ctrl.lat, ctrl.lon, dist=90)
         st.session_state.map_data = new_md
         ctrl.set_map_data(new_md.get("buildings", []), new_md.get("road_graph"))
-        if new_md.get("source") == "merged":
-            st.sidebar.caption(
-                f"Scan expand · buildings={len(new_md.get('building_coords', []))} "
-                f"· center=robot · <100m tile"
-            )
     except Exception:
         pass
 
@@ -88,9 +77,8 @@ with st.sidebar:
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
     live_expand = st.checkbox(
         "Live OSM scan expand while moving (<100m)",
-        value=True,
-        help="Startup always uses instant prebaked obstacles. "
-        "When enabled, new <100m tiles are fetched centered on the robot as it moves.",
+        value=False,
+        help="OFF by default for fast demo. Turn ON only if you want extra real OSM tiles while moving.",
     )
     use_vlm = st.checkbox(
         "Try lightweight VLM (needs HF_TOKEN)",
@@ -147,7 +135,6 @@ if reset_btn or location_name != st.session_state.loc:
     )
     st.rerun()
 
-# Ensure prebaked is present (e.g. first paint)
 if not st.session_state.map_data.get("success"):
     data = load_instant_map(st.session_state.loc, ctrl)
     st.sidebar.success(
@@ -167,11 +154,11 @@ if landmark_btn and landmark.strip():
         explanation.append(f"Target: '{landmark}' ({tlat:.5f}, {tlon:.5f})")
         explanation.append(f"Distance: {dist/1000:.2f} km")
         with st.spinner("Fetching OSRM road route..."):
-            waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon, max_waypoints=100)
+            waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon, max_waypoints=60)
         if waypoints and len(waypoints) > 1:
             st.session_state.route_waypoints = waypoints
             explanation.append(f"OSRM route: {len(waypoints)} waypoints")
-            ctrl.follow_waypoints(waypoints, max_step_m=100.0)
+            ctrl.follow_waypoints(waypoints, max_step_m=80.0)
             if live_expand:
                 maybe_scan_expand(ctrl)
             final_dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
@@ -180,11 +167,11 @@ if landmark_btn and landmark.strip():
         else:
             explanation.append("OSRM failed → direct movement")
             remaining, seg = dist, 0
-            while remaining > 25 and seg < 60:
+            while remaining > 30 and seg < 40:
                 dlat = tlat - ctrl.lat
                 dlon = tlon - ctrl.lon
                 ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                ok = ctrl.move_forward(min(100.0, remaining))
+                ok = ctrl.move_forward(min(80.0, remaining), step_m=25.0)
                 remaining = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
                 seg += 1
                 if not ok:
@@ -212,7 +199,7 @@ if lang_btn and instruction.strip():
 
     for cmd in cmds:
         if cmd.action == "move_forward":
-            ctrl.move_forward(cmd.value or 30.0)
+            ctrl.move_forward(cmd.value or 30.0, step_m=20.0)
         elif cmd.action == "turn_left":
             ctrl.turn_left(cmd.value or 90.0)
         elif cmd.action == "turn_right":
@@ -220,7 +207,7 @@ if lang_btn and instruction.strip():
         elif cmd.action == "return_home":
             ctrl.return_home()
         elif cmd.action in ("follow_road_to", "go_to_landmark"):
-            ctrl.move_forward(cmd.value or 40.0)
+            ctrl.move_forward(cmd.value or 40.0, step_m=20.0)
         st.session_state.history.append(str(cmd))
         explanation.append(f"Executed: {cmd}")
 
@@ -301,6 +288,6 @@ else:
     st.info("Obstacles are prebaked for instant start. Execute a command to move.")
 
 st.caption(
-    "Prebaked obstacles load instantly for every listed map · "
-    "Optional live scan expands <100m tiles centered on the robot while moving"
+    "Prebaked obstacles load instantly · Live expand OFF by default for speed · "
+    "Language + landmark should feel responsive again"
 )
