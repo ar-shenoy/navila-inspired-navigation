@@ -1,5 +1,6 @@
 """
-NaVILA-Lite v2 – Modular version with Landmark + A* support
+NaVILA-Lite v2 – Full modular version
+Includes: Hierarchical planner, OSM buildings/roads, Landmark + A*, Explainability
 """
 
 import streamlit as st
@@ -7,6 +8,7 @@ import folium
 from streamlit_folium import st_folium
 import sys
 from pathlib import Path
+import math
 
 ROOT = Path(__file__).parent
 sys.path.append(str(ROOT))
@@ -17,8 +19,8 @@ from src.high_level.vlm_planner import MapContextPlanner
 from src.high_level.geocoder import geocode
 
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
-st.title("🗺️ NaVILA-Lite v2 – Hierarchical Navigation + Landmarks")
-st.caption("Modular · OSM buildings/roads · Hybrid planner · Landmark navigation · A* ready")
+st.title("🗺️ NaVILA-Lite v2 – Hierarchical Map Navigation")
+st.caption("Modular · OSM semantics · Landmark navigation · A* ready · Explainable")
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
@@ -33,17 +35,17 @@ with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
     load_osm = st.checkbox("Load OSM (buildings + roads)", value=False,
-                           help="Required for A* road following. Can be slow.")
-    
+                           help="Needed for rich map context and A*. Can be slow.")
+
     st.markdown("---")
     st.subheader("Landmark Navigation")
-    landmark = st.text_input("Go to landmark (optional)", placeholder="e.g. Taipei Main Station")
-    use_astar = st.checkbox("Use A* road following (if OSM loaded)", value=True)
+    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei Main Station")
+    use_astar = st.checkbox("Prefer A* road following", value=True)
 
     st.markdown("---")
     instruction = st.text_area(
         "Language Instruction(s)",
-        value="Move forward 80 meters then turn left 90 degrees then move 50 meters",
+        value="Move forward 70 meters then turn left 90 degrees then move 40 meters",
         height=90
     )
     c1, c2 = st.columns(2)
@@ -57,6 +59,7 @@ if "ctrl" not in st.session_state:
     st.session_state.history = []
     st.session_state.loc = "Taipei 101"
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
+    st.session_state.last_explanation = []
 
 ctrl: OSMController = st.session_state.ctrl
 
@@ -64,67 +67,74 @@ if reset_btn or location_name != st.session_state.loc:
     lat, lon = LOCATIONS[location_name]
     ctrl.reset(lat, lon)
     st.session_state.history = []
+    st.session_state.last_explanation = []
     st.session_state.loc = location_name
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
     st.rerun()
 
-# Load OSM if requested
 if load_osm and st.session_state.map_data.get("road_graph") is None:
-    with st.spinner("Loading OSM buildings + road graph (may take time)..."):
+    with st.spinner("Loading OSM data..."):
         data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=400)
         st.session_state.map_data = data
         ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
         if data.get("success"):
-            st.sidebar.success(f"Buildings: {len(data.get('building_coords',[]))} | Road segments: {len(data.get('road_lines',[]))}")
+            st.sidebar.success(f"Buildings: {len(data.get('building_coords',[]))} | Roads: {len(data.get('road_lines',[]))}")
         else:
             st.sidebar.warning(data.get("error", "OSM load failed"))
 
-# Execute logic
+explanation = []
+
 if exec_btn:
-    # 1. Landmark navigation (higher priority)
     if landmark.strip():
         coords = geocode(landmark.strip())
         if coords:
             tlat, tlon = coords
-            st.sidebar.info(f"Landmark found: ({tlat:.5f}, {tlon:.5f})")
+            explanation.append(f"Geocoded '{landmark}' → ({tlat:.5f}, {tlon:.5f})")
             if use_astar and ctrl.road_graph is not None:
                 waypoints = ctrl.plan_road_route(tlat, tlon)
                 if waypoints:
                     ctrl.follow_waypoints(waypoints)
-                    st.session_state.history.append(f"A* route to '{landmark}' ({len(waypoints)} nodes)")
+                    explanation.append(f"A* road route used ({len(waypoints)} nodes)")
+                    st.session_state.history.append(f"A* to '{landmark}'")
                 else:
-                    # fallback straight
-                    dlat = tlat - ctrl.lat
-                    dlon = tlon - ctrl.lon
-                    ctrl.yaw = ( __import__('math').degrees(__import__('math').atan2(dlon, dlat)) + 360) % 360
+                    dlat, dlon = tlat - ctrl.lat, tlon - ctrl.lon
+                    ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
                     dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-                    ctrl.move_forward(min(dist, 300))
-                    st.session_state.history.append(f"Direct move toward '{landmark}' (A* unavailable)")
+                    ctrl.move_forward(min(dist, 250))
+                    explanation.append("A* failed → fell back to direct movement")
+                    st.session_state.history.append(f"Direct to '{landmark}'")
             else:
-                dlat = tlat - ctrl.lat
-                dlon = tlon - ctrl.lon
-                ctrl.yaw = ( __import__('math').degrees(__import__('math').atan2(dlon, dlat)) + 360) % 360
+                dlat, dlon = tlat - ctrl.lat, tlon - ctrl.lon
+                ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
                 dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-                ctrl.move_forward(min(dist, 300))
-                st.session_state.history.append(f"Direct move toward '{landmark}'")
+                ctrl.move_forward(min(dist, 250))
+                explanation.append("Direct movement (A* not available)")
+                st.session_state.history.append(f"Direct to '{landmark}'")
         else:
-            st.sidebar.error(f"Could not geocode: {landmark}")
+            explanation.append(f"Could not geocode '{landmark}'")
+            st.sidebar.error("Geocoding failed")
 
-    # 2. Normal language commands
     if instruction.strip():
         cmds = st.session_state.planner.parse(instruction)
+        explanation.append(f"Parsed {len(cmds)} mid-level command(s)")
         for cmd in cmds:
             if cmd.action == "move_forward":
                 ctrl.move_forward(cmd.value or 30.0)
+                explanation.append(f"Executed: move_forward {cmd.value or 30:.0f}m")
             elif cmd.action == "turn_left":
                 ctrl.turn_left(cmd.value or 90.0)
+                explanation.append(f"Executed: turn_left {cmd.value or 90:.0f}°")
             elif cmd.action == "turn_right":
                 ctrl.turn_right(cmd.value or 90.0)
+                explanation.append(f"Executed: turn_right {cmd.value or 90:.0f}°")
             elif cmd.action == "return_home":
                 ctrl.return_home()
+                explanation.append("Executed: return_home")
             st.session_state.history.append(str(cmd))
 
-# -------------------- Map --------------------
+    st.session_state.last_explanation = explanation
+
+# Map
 m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=16)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
@@ -161,31 +171,38 @@ icon = folium.DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
 folium.Marker([ctrl.lat, ctrl.lon], icon=icon, popup=f"Yaw {ctrl.yaw:.0f}°").add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, width=1000, height=620, key=f"v2_{len(ctrl.path)}")
+st_folium(m, width=1000, height=600, key=f"v2_{len(ctrl.path)}")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
+
 with col1:
     st.subheader("Robot State")
     st.metric("Latitude", f"{ctrl.lat:.6f}")
     st.metric("Longitude", f"{ctrl.lon:.6f}")
-    st.metric("Heading (0=North)", f"{ctrl.yaw:.1f}°")
-    st.write(f"Buildings: {len(st.session_state.map_data.get('building_coords', []))} | "
-             f"Roads: {len(st.session_state.map_data.get('road_lines', []))}")
+    st.metric("Heading", f"{ctrl.yaw:.1f}°")
 
 with col2:
+    st.subheader("Map Context")
+    st.write(f"Buildings loaded: **{len(st.session_state.map_data.get('building_coords', []))}**")
+    st.write(f"Road segments: **{len(st.session_state.map_data.get('road_lines', []))}**")
+    st.write(f"Path points: **{len(ctrl.path)}**")
+
+with col3:
     st.subheader("History")
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-12:]):
+        for h in reversed(st.session_state.history[-8:]):
             st.markdown(f"- `{h}`")
     else:
         st.info("No commands yet")
 
+# Explainability panel
 st.markdown("---")
-st.markdown("""
-**v2 Capabilities**
-- Hierarchical language commands
-- Landmark navigation via Nominatim ("Go to Taipei Main Station")
-- Optional A* road following when OSM road graph is loaded
-- Buildings = obstacles, Roads = preferred paths
-- Modular codebase ready for further VLM integration
-""")
+st.subheader("Why this action? (Explainability)")
+if st.session_state.last_explanation:
+    for line in st.session_state.last_explanation:
+        st.markdown(f"- {line}")
+else:
+    st.info("Execute a command to see the reasoning trace.")
+
+st.markdown("---")
+st.caption("NaVILA-Lite v2 · Hierarchical VLA-style navigation on real maps · Inspired by NaVILA (RSS 2025)")
