@@ -1,0 +1,37 @@
+{
+  "Taipei 101": {
+    "file": "taipei_101.json",
+    "n_buildings": 10,
+    "radius": 100
+  },
+  "National Taiwan University": {
+    "file": "national_taiwan_university.json",
+    "n_buildings": 10,
+    "radius": 100
+  },
+  "Taipei Main Station": {
+    "file": "taipei_main_station.json",
+    "n_buildings": 9,
+    "radius": 100
+  },
+  "Kaohsiung": {
+    "file": "kaohsiung.json",
+    "n_buildings": 9,
+    "radius": 100
+  },
+  "Tainan": {
+    "file": "tainan.json",
+    "n_buildings": 9,
+    "radius": 100
+  },
+  "Bangalore MG Road": {
+    "file": "bangalore_mg_road.json",
+    "n_buildings": 16,
+    "radius": 100
+  },
+  "Open Field": {
+    "file": "open_field.json",
+    "n_buildings": 3,
+    "radius": 100
+  }
+}
