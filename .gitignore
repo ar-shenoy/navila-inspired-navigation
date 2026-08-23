@@ -36,3 +36,6 @@ weights/
 *.log
 wandb/
 runs/
+
+# Local OSM disk cache (end-to-end caching)
+.osm_cache/
