@@ -1,6 +1,6 @@
 """
 Open-source routing via public OSRM server.
-No API key required. Returns real road geometry.
+Returns real road geometry.
 """
 
 from typing import List, Tuple, Optional
