@@ -2,6 +2,7 @@
 NaVILA-Lite v2 – Hierarchical navigation on real OSM maps
 High-level language → mid-level commands → low-level control
 Buildings = obstacles, roads = preferred paths
+Fast progressive OSM: small spawn area first, expand as robot moves
 Fully end-to-end, no hardcoded scenarios
 """
 
@@ -16,7 +17,13 @@ import os
 ROOT = Path(__file__).parent
 sys.path.append(str(ROOT))
 
-from src.map.osm_loader import load_buildings_and_roads
+from src.map.osm_loader import (
+    load_buildings_and_roads,
+    expand_around,
+    needs_expansion,
+    find_free_spawn,
+    INITIAL_RADIUS_M,
+)
 from src.low_level.osm_controller import OSMController
 from src.high_level.vlm_planner import MapContextPlanner
 from src.high_level.geocoder import geocode
@@ -24,7 +31,9 @@ from src.high_level.router import get_osrm_route
 
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
-st.caption("Hierarchical navigation · OSRM road following · Continuous collision + stuck recovery · History-aware")
+st.caption(
+    "Hierarchical navigation · Progressive OSM (~100m first) · Continuous collision + stuck recovery"
+)
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
@@ -45,10 +54,61 @@ def get_hf_token():
     return os.environ.get("HF_TOKEN", None)
 
 
+def ensure_local_map(ctrl: OSMController, force_initial: bool = False):
+    """
+    Progressive map loading:
+    - First call: load small ~100m patch around robot
+    - Later: expand only when robot approaches edge of loaded area
+    - If spawned inside a building → move to free space
+    """
+    md = st.session_state.map_data
+    has_data = bool(md.get("building_coords") or md.get("success"))
+
+    if force_initial or not has_data:
+        with st.spinner(f"Loading local OSM (~{INITIAL_RADIUS_M}m around spawn)..."):
+            data = load_buildings_and_roads(
+                ctrl.lat, ctrl.lon, dist=INITIAL_RADIUS_M, use_cache=True, load_roads=True
+            )
+            st.session_state.map_data = data
+            ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
+
+            # Exit obstacle if we spawned inside a building
+            free_lat, free_lon = find_free_spawn(
+                ctrl.lat, ctrl.lon, data.get("buildings", [])
+            )
+            if abs(free_lat - ctrl.lat) > 1e-7 or abs(free_lon - ctrl.lon) > 1e-7:
+                ctrl.lat, ctrl.lon = free_lat, free_lon
+                ctrl.path.append((free_lat, free_lon))
+                if hasattr(ctrl, "position_history"):
+                    ctrl.position_history.append((free_lat, free_lon))
+                st.sidebar.info("Spawn was inside a building → moved to free space")
+
+            if data.get("success"):
+                src = "cache" if data.get("from_cache") else "live"
+                st.sidebar.success(
+                    f"OSM ({src}): {len(data.get('building_coords', []))} buildings "
+                    f"· radius ~{data.get('radius', INITIAL_RADIUS_M)}m"
+                )
+            else:
+                st.sidebar.warning((data.get("error") or "OSM failed")[:90])
+        return
+
+    # Expand as robot moves near the edge
+    if needs_expansion(md, ctrl.lat, ctrl.lon):
+        with st.spinner("Expanding map around robot..."):
+            new_md = expand_around(md, ctrl.lat, ctrl.lon)
+            st.session_state.map_data = new_md
+            ctrl.set_map_data(new_md.get("buildings", []), new_md.get("road_graph"))
+            st.sidebar.caption(
+                f"Map expanded · buildings={len(new_md.get('building_coords', []))} "
+                f"· radius~{new_md.get('radius', '?')}m"
+            )
+
+
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_osm = st.checkbox("Load local OSM (cached when possible)", value=False)
+    load_osm = st.checkbox("Load local OSM (progressive, ~100m first)", value=True)
     use_vlm = st.checkbox("Try lightweight VLM", value=False)
 
     st.markdown("---")
@@ -79,6 +139,9 @@ if "ctrl" not in st.session_state:
         "road_lines": [],
         "buildings": [],
         "road_graph": None,
+        "success": False,
+        "center": None,
+        "radius": 0,
     }
     st.session_state.last_explanation = []
     st.session_state.route_waypoints = []
@@ -98,25 +161,23 @@ if reset_btn or location_name != st.session_state.loc:
         "road_lines": [],
         "buildings": [],
         "road_graph": None,
+        "success": False,
+        "center": None,
+        "radius": 0,
     }
     st.session_state.route_waypoints = []
     st.rerun()
 
-if load_osm and not st.session_state.map_data.get("building_coords"):
-    with st.spinner("Loading local OSM (disk + memory cache)..."):
-        data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=250)
-        st.session_state.map_data = data
-        ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
-        if data.get("success"):
-            src = "cache" if data.get("from_cache") else "live Overpass"
-            st.sidebar.success(f"OSM ({src}): {len(data.get('building_coords', []))} buildings")
-        else:
-            st.sidebar.warning(data.get("error", "OSM failed")[:80])
+# Progressive OSM load / expand
+if load_osm:
+    ensure_local_map(ctrl, force_initial=not st.session_state.map_data.get("success"))
 
 explanation = []
 
 # ---- Landmark: full OSRM follow (primary path) ----
 if landmark_btn and landmark.strip():
+    if load_osm:
+        ensure_local_map(ctrl)
     coords = geocode(landmark.strip())
     if coords is None:
         explanation.append(f"Could not geocode '{landmark}'")
@@ -133,8 +194,10 @@ if landmark_btn and landmark.strip():
         if waypoints and len(waypoints) > 1:
             st.session_state.route_waypoints = waypoints
             explanation.append(f"OSRM route: {len(waypoints)} waypoints (prefer roads)")
-            # Primary: follow complete road route with continuous collision + stuck recovery
-            ctrl.follow_waypoints(waypoints, max_step_m=120.0)
+            ctrl.follow_waypoints(waypoints, max_step_m=100.0)
+            # expand map after movement
+            if load_osm:
+                ensure_local_map(ctrl)
             final_dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
             explanation.append(f"Route followed. Remaining to target: {final_dist:.0f} m")
             explanation.append(f"State: {ctrl.get_state_summary()}")
@@ -147,12 +210,14 @@ if landmark_btn and landmark.strip():
                 dlat = tlat - ctrl.lat
                 dlon = tlon - ctrl.lon
                 ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                step = min(120.0, remaining)
+                step = min(100.0, remaining)
                 ok = ctrl.move_forward(step)
                 remaining = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
                 seg += 1
                 if not ok:
                     break
+                if load_osm and seg % 3 == 0:
+                    ensure_local_map(ctrl)
             st.session_state.history.append(f"Direct to '{landmark}'")
             explanation.append(f"State: {ctrl.get_state_summary()}")
 
@@ -160,6 +225,8 @@ if landmark_btn and landmark.strip():
 
 # ---- Language (history-aware) ----
 if lang_btn and instruction.strip():
+    if load_osm:
+        ensure_local_map(ctrl)
     state_sum = ctrl.get_state_summary()
     map_ctx = st.session_state.planner.build_map_context_summary(
         len(st.session_state.map_data.get("building_coords", [])),
@@ -181,20 +248,14 @@ if lang_btn and instruction.strip():
             ctrl.turn_right(cmd.value or 90.0)
         elif cmd.action == "return_home":
             ctrl.return_home()
-        elif cmd.action == "follow_road_to":
-            # If we have a road graph, try a short road-preferring step toward current heading
-            if ctrl.road_graph is not None:
-                # simple: move forward while preferring roads (already handled by collision + recovery)
-                ctrl.move_forward(cmd.value or 40.0)
-            else:
-                ctrl.move_forward(cmd.value or 40.0)
-        elif cmd.action == "go_to_landmark":
-            # treat as extra forward if no separate landmark flow triggered
-            ctrl.move_forward(cmd.value or 50.0)
+        elif cmd.action in ("follow_road_to", "go_to_landmark"):
+            ctrl.move_forward(cmd.value or 40.0)
         elif cmd.action == "stop":
             pass
         st.session_state.history.append(str(cmd))
         explanation.append(f"Executed: {cmd}")
+        if load_osm:
+            ensure_local_map(ctrl)
 
     explanation.append(f"State after: {ctrl.get_state_summary()}")
     st.session_state.last_explanation = explanation
@@ -202,7 +263,7 @@ if lang_btn and instruction.strip():
 # ---- Map ----
 m = folium.Map(
     location=[ctrl.lat, ctrl.lon],
-    zoom_start=12 if len(st.session_state.route_waypoints) > 40 else 15,
+    zoom_start=16,  # closer zoom matches ~100m local area
 )
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
@@ -213,7 +274,6 @@ folium.TileLayer(
     name="Satellite",
 ).add_to(m)
 
-# Purple = OSRM planned road route
 if st.session_state.route_waypoints:
     try:
         folium.PolyLine(
@@ -255,7 +315,7 @@ icon = folium.DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
 folium.Marker([ctrl.lat, ctrl.lon], icon=icon, popup=f"Yaw {ctrl.yaw:.0f}°").add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, width=1000, height=560, key=f"map_{len(ctrl.path)}")
+st_folium(m, width=1000, height=560, key=f"map_{len(ctrl.path)}_{len(st.session_state.map_data.get('building_coords', []))}")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -274,13 +334,18 @@ with col2:
         st.metric("Path efficiency (live)", f"{efficiency:.2f}")
 
 with col3:
-    st.subheader("History")
+    st.subheader("Map / History")
+    md = st.session_state.map_data
+    st.caption(
+        f"Loaded radius ~{md.get('radius', 0)}m · "
+        f"buildings={len(md.get('building_coords', []))} · "
+        f"roads={len(md.get('road_lines', []))}"
+    )
     if st.session_state.history:
-        for h in reversed(st.session_state.history[-8:]):
+        for h in reversed(st.session_state.history[-6:]):
             st.markdown(f"- `{h}`")
     else:
         st.info("No commands yet")
-    st.caption(ctrl.get_state_summary()[:90] + "...")
 
 st.markdown("---")
 st.subheader("Explainability")
@@ -291,6 +356,6 @@ else:
     st.info("Execute Landmark or Language to see reasoning.")
 
 st.caption(
-    "Purple = OSRM planned roads · Blue = actual path · Red polygons = buildings (obstacles) · "
-    "Continuous collision + stuck recovery · History fed to planner"
+    "Purple = OSRM roads · Blue = path · Red = buildings · "
+    "OSM loads ~100m first, expands as you move · auto-exit if spawned in building"
 )
