@@ -1,8 +1,5 @@
 """
-OSM-aware Low-Level Controller
-- Road graph A* routing when possible
-- Shapely building collision
-- Fallback to reactive movement
+OSM-aware Low-Level Controller with movement quality scoring.
 """
 
 from typing import List, Tuple, Optional
@@ -10,24 +7,25 @@ import math
 
 try:
     import networkx as nx
-    from shapely.geometry import Point
     HAS_NX = True
 except ImportError:
     HAS_NX = False
 
 from src.map.osm_loader import point_in_buildings, get_nearest_road_node
 
-
 class OSMController:
     def __init__(self, lat: float, lon: float, yaw: float = 0.0):
         self.lat = lat
         self.lon = lon
-        self.yaw = yaw  # 0 = North, 90 = East
+        self.yaw = yaw
         self.start_lat = lat
         self.start_lon = lon
         self.path: List[Tuple[float, float]] = [(lat, lon)]
         self.buildings = []
         self.road_graph = None
+        self.total_distance = 0.0
+        self.collision_count = 0
+        self.score = 0.0
 
     def reset(self, lat: float, lon: float, yaw: float = 0.0):
         self.lat = lat
@@ -36,6 +34,9 @@ class OSMController:
         self.start_lat = lat
         self.start_lon = lon
         self.path = [(lat, lon)]
+        self.total_distance = 0.0
+        self.collision_count = 0
+        self.score = 0.0
 
     def set_map_data(self, buildings, road_graph):
         self.buildings = buildings or []
@@ -52,8 +53,15 @@ class OSMController:
     def is_collision(self, lat: float, lon: float) -> bool:
         return point_in_buildings(lat, lon, self.buildings)
 
+    def _update_score(self, dist_moved: float, collided: bool):
+        self.total_distance += dist_moved
+        if collided:
+            self.collision_count += 1
+            self.score -= 2.0
+        else:
+            self.score += dist_moved * 0.05  # small progress reward
+
     def move_forward(self, distance_m: float, step_m: float = 6.0):
-        """Reactive forward movement with building avoidance."""
         steps = max(1, int(distance_m / step_m))
         actual = distance_m / steps
         for _ in range(steps):
@@ -66,7 +74,7 @@ class OSMController:
             new_lon = self.lon + dlon
 
             if self.is_collision(new_lat, new_lon):
-                # try small turns
+                self._update_score(0, collided=True)
                 moved = False
                 for delta in [25, -25, 50, -50, 80, -80]:
                     test_yaw = (self.yaw + delta) % 360
@@ -80,14 +88,16 @@ class OSMController:
                         self.lat = tlat
                         self.lon = tlon
                         self.path.append((tlat, tlon))
+                        self._update_score(actual, collided=False)
                         moved = True
                         break
                 if not moved:
-                    return  # stuck
+                    return
             else:
                 self.lat = new_lat
                 self.lon = new_lon
                 self.path.append((new_lat, new_lon))
+                self._update_score(actual, collided=False)
 
     def turn_left(self, degrees: float = 90.0):
         self.yaw = (self.yaw - degrees) % 360
@@ -103,7 +113,6 @@ class OSMController:
         self.move_forward(dist)
 
     def plan_road_route(self, target_lat: float, target_lon: float) -> List[Tuple[float, float]]:
-        """A* on the road graph if available."""
         if self.road_graph is None or not HAS_NX:
             return []
         try:
@@ -112,20 +121,14 @@ class OSMController:
             if start_node is None or end_node is None:
                 return []
             route = nx.shortest_path(self.road_graph, start_node, end_node, weight="length")
-            waypoints = []
-            for n in route:
-                y = self.road_graph.nodes[n]["y"]
-                x = self.road_graph.nodes[n]["x"]
-                waypoints.append((y, x))
-            return waypoints
+            return [(self.road_graph.nodes[n]["y"], self.road_graph.nodes[n]["x"]) for n in route]
         except Exception:
             return []
 
     def follow_waypoints(self, waypoints: List[Tuple[float, float]]):
-        """Follow a list of (lat, lon) waypoints."""
         for (tlat, tlon) in waypoints:
             dlat = tlat - self.lat
             dlon = tlon - self.lon
             self.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
             dist = self._distance_m(self.lat, self.lon, tlat, tlon)
-            self.move_forward(min(dist, 40.0))  # limit per segment
+            self.move_forward(min(dist, 35.0))
