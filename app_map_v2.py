@@ -1,9 +1,8 @@
 """
 NaVILA-Lite v2 – Hierarchical navigation on real OSM maps
 High-level language → mid-level commands → low-level control
-Buildings = obstacles, roads = preferred paths
-Fast progressive OSM: small spawn area first, expand as robot moves
-Fully end-to-end, no hardcoded scenarios
+Buildings = obstacles (loaded first, fast) · Roads via public OSRM
+Progressive OSM · never blocks movement on slow Overpass
 """
 
 import streamlit as st
@@ -32,7 +31,7 @@ from src.high_level.router import get_osrm_route
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
 st.caption(
-    "Hierarchical navigation · Progressive OSM (~100m first) · Continuous collision + stuck recovery"
+    "Hierarchical navigation · Buildings-first OSM (~180m) · OSRM roads · Collision + stuck recovery"
 )
 
 LOCATIONS = {
@@ -54,25 +53,28 @@ def get_hf_token():
     return os.environ.get("HF_TOKEN", None)
 
 
-def ensure_local_map(ctrl: OSMController, force_initial: bool = False):
+def ensure_local_map(ctrl: OSMController, force_initial: bool = False, allow_expand: bool = True):
     """
-    Progressive map loading:
-    - First call: load small ~100m patch around robot
-    - Later: expand only when robot approaches edge of loaded area
-    - If spawned inside a building → move to free space
+    Progressive map loading — NEVER blocks forever.
+    - Initial: buildings only ~180m (fast)
+    - Expand: at most once per call, buildings only
+    - On failure: keep going with whatever we have
     """
     md = st.session_state.map_data
-    has_data = bool(md.get("building_coords") or md.get("success"))
+    has_data = bool(md.get("success"))
 
     if force_initial or not has_data:
-        with st.spinner(f"Loading local OSM (~{INITIAL_RADIUS_M}m around spawn)..."):
+        with st.spinner(f"Loading buildings (~{INITIAL_RADIUS_M}m, no road graph)..."):
             data = load_buildings_and_roads(
-                ctrl.lat, ctrl.lon, dist=INITIAL_RADIUS_M, use_cache=True, load_roads=True
+                ctrl.lat,
+                ctrl.lon,
+                dist=INITIAL_RADIUS_M,
+                use_cache=True,
+                load_roads=False,  # FAST path
             )
             st.session_state.map_data = data
             ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
 
-            # Exit obstacle if we spawned inside a building
             free_lat, free_lon = find_free_spawn(
                 ctrl.lat, ctrl.lon, data.get("buildings", [])
             )
@@ -86,34 +88,45 @@ def ensure_local_map(ctrl: OSMController, force_initial: bool = False):
             if data.get("success"):
                 src = "cache" if data.get("from_cache") else "live"
                 st.sidebar.success(
-                    f"OSM ({src}): {len(data.get('building_coords', []))} buildings "
-                    f"· radius ~{data.get('radius', INITIAL_RADIUS_M)}m"
+                    f"Buildings ({src}): {len(data.get('building_coords', []))} · "
+                    f"~{data.get('radius', INITIAL_RADIUS_M)}m"
                 )
             else:
-                st.sidebar.warning((data.get("error") or "OSM failed")[:90])
+                st.sidebar.warning((data.get("error") or "OSM failed — movement still works")[:100])
         return
 
-    # Expand as robot moves near the edge
+    if not allow_expand:
+        return
+
+    # Expand at most once; never stall the whole command loop
     if needs_expansion(md, ctrl.lat, ctrl.lon):
-        with st.spinner("Expanding map around robot..."):
+        try:
             new_md = expand_around(md, ctrl.lat, ctrl.lon)
             st.session_state.map_data = new_md
             ctrl.set_map_data(new_md.get("buildings", []), new_md.get("road_graph"))
             st.sidebar.caption(
-                f"Map expanded · buildings={len(new_md.get('building_coords', []))} "
-                f"· radius~{new_md.get('radius', '?')}m"
+                f"Expanded · buildings={len(new_md.get('building_coords', []))} "
+                f"· ~{new_md.get('radius', '?')}m"
             )
+        except Exception:
+            pass  # keep previous map, do not block movement
 
 
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_osm = st.checkbox("Load local OSM (progressive, ~100m first)", value=True)
-    use_vlm = st.checkbox("Try lightweight VLM", value=False)
+    load_osm = st.checkbox("Load local OSM buildings (fast progressive)", value=True)
+    use_vlm = st.checkbox(
+        "Try lightweight VLM (needs HF_TOKEN)",
+        value=False,
+        help="Optional: call Phi-3 on Hugging Face to parse language into mid-level commands. "
+        "Without a token, or on failure, the built-in heuristic parser is used. "
+        "Does NOT control the robot by itself.",
+    )
 
     st.markdown("---")
     st.subheader("1. Landmark Navigation")
-    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei 101 / Taipei Main Station")
+    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei Main Station")
     landmark_btn = st.button("Execute Landmark", type="primary")
 
     st.markdown("---")
@@ -168,16 +181,14 @@ if reset_btn or location_name != st.session_state.loc:
     st.session_state.route_waypoints = []
     st.rerun()
 
-# Progressive OSM load / expand
-if load_osm:
-    ensure_local_map(ctrl, force_initial=not st.session_state.map_data.get("success"))
+# Initial progressive OSM (buildings only) — once
+if load_osm and not st.session_state.map_data.get("success"):
+    ensure_local_map(ctrl, force_initial=True, allow_expand=False)
 
 explanation = []
 
-# ---- Landmark: full OSRM follow (primary path) ----
+# ---- Landmark (OSRM does the heavy road work; local OSM is only obstacles) ----
 if landmark_btn and landmark.strip():
-    if load_osm:
-        ensure_local_map(ctrl)
     coords = geocode(landmark.strip())
     if coords is None:
         explanation.append(f"Could not geocode '{landmark}'")
@@ -189,24 +200,23 @@ if landmark_btn and landmark.strip():
         explanation.append(f"Distance: {dist/1000:.2f} km")
 
         with st.spinner("Fetching OSRM road route..."):
-            waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon, max_waypoints=120)
+            waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon, max_waypoints=100)
 
         if waypoints and len(waypoints) > 1:
             st.session_state.route_waypoints = waypoints
-            explanation.append(f"OSRM route: {len(waypoints)} waypoints (prefer roads)")
+            explanation.append(f"OSRM route: {len(waypoints)} waypoints")
             ctrl.follow_waypoints(waypoints, max_step_m=100.0)
-            # expand map after movement
             if load_osm:
-                ensure_local_map(ctrl)
+                ensure_local_map(ctrl, allow_expand=True)
             final_dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-            explanation.append(f"Route followed. Remaining to target: {final_dist:.0f} m")
+            explanation.append(f"Route followed. Remaining: {final_dist:.0f} m")
             explanation.append(f"State: {ctrl.get_state_summary()}")
-            st.session_state.history.append(f"OSRM full route to '{landmark}'")
+            st.session_state.history.append(f"OSRM route to '{landmark}'")
         else:
-            explanation.append("OSRM failed → direct segmented movement with recovery")
+            explanation.append("OSRM failed → direct movement with collision recovery")
             remaining = dist
             seg = 0
-            while remaining > 25 and seg < 80:
+            while remaining > 25 and seg < 60:
                 dlat = tlat - ctrl.lat
                 dlon = tlon - ctrl.lon
                 ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
@@ -216,17 +226,15 @@ if landmark_btn and landmark.strip():
                 seg += 1
                 if not ok:
                     break
-                if load_osm and seg % 3 == 0:
-                    ensure_local_map(ctrl)
+            if load_osm:
+                ensure_local_map(ctrl, allow_expand=True)
             st.session_state.history.append(f"Direct to '{landmark}'")
             explanation.append(f"State: {ctrl.get_state_summary()}")
 
     st.session_state.last_explanation = explanation
 
-# ---- Language (history-aware) ----
+# ---- Language: ALWAYS execute immediately (OSM expand only after) ----
 if lang_btn and instruction.strip():
-    if load_osm:
-        ensure_local_map(ctrl)
     state_sum = ctrl.get_state_summary()
     map_ctx = st.session_state.planner.build_map_context_summary(
         len(st.session_state.map_data.get("building_coords", [])),
@@ -236,8 +244,12 @@ if lang_btn and instruction.strip():
         state_summary=state_sum,
     )
     cmds = st.session_state.planner.parse(instruction, map_context=map_ctx)
-    explanation.append(f"Parsed {len(cmds)} cmd(s) · source={cmds[0].source if cmds else '?'}")
-    explanation.append(f"Context used: {map_ctx[:120]}...")
+    src = cmds[0].source if cmds else "?"
+    explanation.append(f"Parsed {len(cmds)} cmd(s) · source={src}")
+    if use_vlm and src == "heuristic":
+        explanation.append(
+            "VLM not used (no HF_TOKEN / API fail / disabled) → heuristic parser"
+        )
 
     for cmd in cmds:
         if cmd.action == "move_forward":
@@ -254,17 +266,16 @@ if lang_btn and instruction.strip():
             pass
         st.session_state.history.append(str(cmd))
         explanation.append(f"Executed: {cmd}")
-        if load_osm:
-            ensure_local_map(ctrl)
+
+    # One expand after movement — never inside the command loop
+    if load_osm:
+        ensure_local_map(ctrl, allow_expand=True)
 
     explanation.append(f"State after: {ctrl.get_state_summary()}")
     st.session_state.last_explanation = explanation
 
 # ---- Map ----
-m = folium.Map(
-    location=[ctrl.lat, ctrl.lon],
-    zoom_start=16,  # closer zoom matches ~100m local area
-)
+m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=16)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
@@ -281,7 +292,7 @@ if st.session_state.route_waypoints:
             color="#9b59b6",
             weight=4,
             opacity=0.7,
-            popup="OSRM plan (prefer roads)",
+            popup="OSRM plan",
         ).add_to(m)
     except Exception:
         pass
@@ -315,7 +326,12 @@ icon = folium.DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
 folium.Marker([ctrl.lat, ctrl.lon], icon=icon, popup=f"Yaw {ctrl.yaw:.0f}°").add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, width=1000, height=560, key=f"map_{len(ctrl.path)}_{len(st.session_state.map_data.get('building_coords', []))}")
+st_folium(
+    m,
+    width=1000,
+    height=560,
+    key=f"map_{len(ctrl.path)}_{len(st.session_state.map_data.get('building_coords', []))}",
+)
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -337,9 +353,8 @@ with col3:
     st.subheader("Map / History")
     md = st.session_state.map_data
     st.caption(
-        f"Loaded radius ~{md.get('radius', 0)}m · "
-        f"buildings={len(md.get('building_coords', []))} · "
-        f"roads={len(md.get('road_lines', []))}"
+        f"~{md.get('radius', 0)}m · buildings={len(md.get('building_coords', []))} · "
+        f"road_lines={len(md.get('road_lines', []))}"
     )
     if st.session_state.history:
         for h in reversed(st.session_state.history[-6:]):
@@ -356,6 +371,6 @@ else:
     st.info("Execute Landmark or Language to see reasoning.")
 
 st.caption(
-    "Purple = OSRM roads · Blue = path · Red = buildings · "
-    "OSM loads ~100m first, expands as you move · auto-exit if spawned in building"
+    "Buildings-first OSM (obstacles) · OSRM for long routes · "
+    "Language never waits on Overpass · VLM optional (HF_TOKEN)"
 )
