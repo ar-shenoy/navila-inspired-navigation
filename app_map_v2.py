@@ -1,10 +1,5 @@
 """
-NaVILA-Lite v2 – Submission candidate
-- Separate Landmark / Language execution
-- OSRM real-road routing for landmarks (long distance in one click)
-- Local OSM optional for nearby obstacles
-- Dynamic local refresh
-- Explainability + score
+NaVILA-Lite v2 – Full OSRM route following
 """
 
 import streamlit as st
@@ -26,7 +21,7 @@ from src.high_level.router import get_osrm_route
 
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
-st.caption("Hierarchical navigation · OSRM real-road landmark routing · Dynamic local OSM · Explainable")
+st.caption("Hierarchical navigation · Full OSRM road following · Optional local OSM")
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
@@ -48,14 +43,12 @@ def get_hf_token():
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_osm = st.checkbox("Load local OSM (nearby buildings/roads)", value=False,
-                           help="Optional local obstacles. Can be slow.")
-    use_vlm = st.checkbox("Try lightweight VLM", value=False,
-                          help="Needs HF_TOKEN in env or Streamlit secrets.")
+    load_osm = st.checkbox("Load local OSM (optional, can be slow)", value=False)
+    use_vlm = st.checkbox("Try lightweight VLM", value=False)
 
     st.markdown("---")
     st.subheader("1. Landmark Navigation")
-    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei 101")
+    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei 101 / Taipei Main Station")
     landmark_btn = st.button("Execute Landmark", type="primary")
 
     st.markdown("---")
@@ -78,7 +71,6 @@ if "ctrl" not in st.session_state:
     st.session_state.loc = "Taipei 101"
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
     st.session_state.last_explanation = []
-    st.session_state.last_load_center = (lat, lon)
     st.session_state.route_waypoints = []
 
 ctrl: OSMController = st.session_state.ctrl
@@ -92,33 +84,22 @@ if reset_btn or location_name != st.session_state.loc:
     st.session_state.last_explanation = []
     st.session_state.loc = location_name
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
-    st.session_state.last_load_center = (lat, lon)
     st.session_state.route_waypoints = []
     st.rerun()
 
-def maybe_load_osm(force=False):
-    if not load_osm:
-        return
-    dist_moved = ctrl._distance_m(ctrl.lat, ctrl.lon,
-                                  st.session_state.last_load_center[0],
-                                  st.session_state.last_load_center[1])
-    need = force or st.session_state.map_data.get("road_graph") is None or dist_moved > 150
-    if need:
-        with st.spinner("Refreshing local OSM..."):
-            data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=250)
-            if st.session_state.map_data.get("building_coords"):
-                data["building_coords"] = (st.session_state.map_data["building_coords"] + data.get("building_coords", []))[-50:]
-                data["road_lines"] = (st.session_state.map_data.get("road_lines", []) + data.get("road_lines", []))[-70:]
-            st.session_state.map_data = data
-            ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
-            st.session_state.last_load_center = (ctrl.lat, ctrl.lon)
-
-if load_osm and st.session_state.map_data.get("road_graph") is None:
-    maybe_load_osm(force=True)
+if load_osm and not st.session_state.map_data.get("building_coords"):
+    with st.spinner("Loading local OSM (optional)..."):
+        data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=200)
+        st.session_state.map_data = data
+        ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
+        if data.get("success"):
+            st.sidebar.success(f"Local buildings: {len(data.get('building_coords', []))}")
+        else:
+            st.sidebar.warning(data.get("error", "OSM failed")[:80])
 
 explanation = []
 
-# ---------- Landmark (OSRM real roads, one click) ----------
+# ---- Landmark: full OSRM follow ----
 if landmark_btn and landmark.strip():
     coords = geocode(landmark.strip())
     if coords is None:
@@ -127,38 +108,37 @@ if landmark_btn and landmark.strip():
     else:
         tlat, tlon = coords
         dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-        explanation.append(f"Target '{landmark}' at ({tlat:.5f}, {tlon:.5f})")
-        explanation.append(f"Straight-line distance: {dist/1000:.2f} km")
+        explanation.append(f"Target: '{landmark}' ({tlat:.5f}, {tlon:.5f})")
+        explanation.append(f"Distance: {dist/1000:.2f} km")
 
-        # Primary: OSRM real road route (works for long distances)
-        waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon)
+        with st.spinner("Fetching OSRM road route..."):
+            waypoints = get_osrm_route(ctrl.lat, ctrl.lon, tlat, tlon, max_waypoints=120)
+
         if waypoints and len(waypoints) > 1:
             st.session_state.route_waypoints = waypoints
-            explanation.append(f"OSRM returned {len(waypoints)} road waypoints")
-            # Follow the full route in this single execution
-            ctrl.follow_waypoints(waypoints)
-            explanation.append("Followed full OSRM road route in one execution")
-            st.session_state.history.append(f"OSRM route to '{landmark}' ({dist/1000:.1f} km)")
+            explanation.append(f"OSRM route: {len(waypoints)} waypoints")
+            # Follow COMPLETE route in this single click
+            ctrl.follow_waypoints(waypoints, max_step_m=150.0)
+            final_dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
+            explanation.append(f"Route followed. Remaining to target: {final_dist:.0f} m")
+            st.session_state.history.append(f"OSRM full route to '{landmark}'")
         else:
-            # Fallback: segmented direct movement
-            explanation.append("OSRM unavailable → segmented direct movement")
+            explanation.append("OSRM failed → direct segmented movement")
             remaining = dist
             seg = 0
-            while remaining > 20 and seg < 60:
+            while remaining > 30 and seg < 80:
                 dlat = tlat - ctrl.lat
                 dlon = tlon - ctrl.lon
                 ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                step = min(120.0, remaining)
+                step = min(150.0, remaining)
                 ctrl.move_forward(step)
                 remaining = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
                 seg += 1
-                if load_osm and seg % 4 == 0:
-                    maybe_load_osm()
-            st.session_state.history.append(f"Direct segments to '{landmark}'")
+            st.session_state.history.append(f"Direct to '{landmark}'")
 
     st.session_state.last_explanation = explanation
 
-# ---------- Language ----------
+# ---- Language ----
 if lang_btn and instruction.strip():
     map_ctx = st.session_state.planner.build_map_context_summary(
         len(st.session_state.map_data.get("building_coords", [])),
@@ -166,7 +146,7 @@ if lang_btn and instruction.strip():
         ctrl.lat, ctrl.lon
     )
     cmds = st.session_state.planner.parse(instruction, map_context=map_ctx)
-    explanation.append(f"Parsed {len(cmds)} command(s) · source={cmds[0].source if cmds else 'none'}")
+    explanation.append(f"Parsed {len(cmds)} cmd(s) · source={cmds[0].source if cmds else '?'}")
     for cmd in cmds:
         if cmd.action == "move_forward":
             ctrl.move_forward(cmd.value or 30.0)
@@ -178,12 +158,10 @@ if lang_btn and instruction.strip():
             ctrl.return_home()
         st.session_state.history.append(str(cmd))
         explanation.append(f"Executed: {cmd}")
-    if load_osm:
-        maybe_load_osm()
     st.session_state.last_explanation = explanation
 
-# ---------- Map ----------
-m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=13 if len(ctrl.path) > 20 else 15)
+# ---- Map ----
+m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=12 if len(st.session_state.route_waypoints) > 40 else 15)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
@@ -192,16 +170,16 @@ folium.TileLayer(
     attr="Esri", name="Satellite"
 ).add_to(m)
 
-# OSRM planned route (if any)
+# Purple = OSRM planned road route
 if st.session_state.route_waypoints:
     try:
-        folium.PolyLine(st.session_state.route_waypoints, color="#9b59b6", weight=4, opacity=0.6, popup="OSRM plan").add_to(m)
+        folium.PolyLine(st.session_state.route_waypoints, color="#9b59b6", weight=4, opacity=0.7, popup="OSRM plan").add_to(m)
     except Exception:
         pass
 
 for line in st.session_state.map_data.get("road_lines", []):
     try:
-        folium.PolyLine(line, color="#f1c40f", weight=2, opacity=0.55).add_to(m)
+        folium.PolyLine(line, color="#f1c40f", weight=2, opacity=0.5).add_to(m)
     except Exception:
         pass
 
@@ -257,4 +235,4 @@ if st.session_state.last_explanation:
 else:
     st.info("Execute Landmark or Language to see reasoning.")
 
-st.caption("NaVILA-Lite v2 · OSRM open routing for landmarks · Local OSM optional · Inspired by NaVILA")
+st.caption("Purple = OSRM planned roads · Blue = actual path · Local OSM optional")

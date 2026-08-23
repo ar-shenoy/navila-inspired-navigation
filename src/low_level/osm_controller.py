@@ -1,5 +1,8 @@
 """
-OSM-aware Low-Level Controller with movement quality scoring.
+OSM-aware Low-Level Controller
+- Full waypoint following (no early stop)
+- Reactive local avoidance
+- Movement scoring
 """
 
 from typing import List, Tuple, Optional
@@ -12,6 +15,7 @@ except ImportError:
     HAS_NX = False
 
 from src.map.osm_loader import point_in_buildings, get_nearest_road_node
+
 
 class OSMController:
     def __init__(self, lat: float, lon: float, yaw: float = 0.0):
@@ -48,7 +52,7 @@ class OSMController:
         dphi = math.radians(lat2 - lat1)
         dlambda = math.radians(lon2 - lon1)
         a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     def is_collision(self, lat: float, lon: float) -> bool:
         return point_in_buildings(lat, lon, self.buildings)
@@ -59,15 +63,15 @@ class OSMController:
             self.collision_count += 1
             self.score -= 2.0
         else:
-            self.score += dist_moved * 0.05  # small progress reward
+            self.score += dist_moved * 0.05
 
-    def move_forward(self, distance_m: float, step_m: float = 6.0):
+    def move_forward(self, distance_m: float, step_m: float = 8.0):
         steps = max(1, int(distance_m / step_m))
         actual = distance_m / steps
         for _ in range(steps):
             rad = math.radians(self.yaw)
             d_north = actual * math.cos(rad)
-            d_east  = actual * math.sin(rad)
+            d_east = actual * math.sin(rad)
             dlat = d_north / 111320.0
             dlon = d_east / (111320.0 * math.cos(math.radians(self.lat)) + 1e-8)
             new_lat = self.lat + dlat
@@ -76,7 +80,7 @@ class OSMController:
             if self.is_collision(new_lat, new_lon):
                 self._update_score(0, collided=True)
                 moved = False
-                for delta in [25, -25, 50, -50, 80, -80]:
+                for delta in [20, -20, 40, -40, 70, -70, 110, -110]:
                     test_yaw = (self.yaw + delta) % 360
                     rad_t = math.radians(test_yaw)
                     dn = actual * math.cos(rad_t)
@@ -92,12 +96,13 @@ class OSMController:
                         moved = True
                         break
                 if not moved:
-                    return
+                    return False
             else:
                 self.lat = new_lat
                 self.lon = new_lon
                 self.path.append((new_lat, new_lon))
                 self._update_score(actual, collided=False)
+        return True
 
     def turn_left(self, degrees: float = 90.0):
         self.yaw = (self.yaw - degrees) % 360
@@ -125,10 +130,38 @@ class OSMController:
         except Exception:
             return []
 
-    def follow_waypoints(self, waypoints: List[Tuple[float, float]]):
+    def follow_waypoints(self, waypoints: List[Tuple[float, float]], max_step_m: float = 120.0):
+        """
+        Follow the FULL waypoint list until the end.
+        No early exit except if completely stuck.
+        """
+        if not waypoints:
+            return
+
         for (tlat, tlon) in waypoints:
-            dlat = tlat - self.lat
-            dlon = tlon - self.lon
-            self.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+            # Keep stepping toward this waypoint until close enough
+            for _ in range(30):  # safety cap per waypoint
+                dist = self._distance_m(self.lat, self.lon, tlat, tlon)
+                if dist < 25:  # close enough → next waypoint
+                    break
+
+                dlat = tlat - self.lat
+                dlon = tlon - self.lon
+                self.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+
+                step = min(max_step_m, dist)
+                ok = self.move_forward(step)
+                if not ok:
+                    # slightly larger step attempt with different yaw already handled inside
+                    # if still stuck, skip to next waypoint rather than freezing whole route
+                    break
+
+        # Final snap toward last point if still a bit away
+        if waypoints:
+            tlat, tlon = waypoints[-1]
             dist = self._distance_m(self.lat, self.lon, tlat, tlon)
-            self.move_forward(min(dist, 35.0))
+            if dist > 30:
+                dlat = tlat - self.lat
+                dlon = tlon - self.lon
+                self.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+                self.move_forward(min(dist, 200.0))
