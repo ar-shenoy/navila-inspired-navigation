@@ -1,10 +1,10 @@
 """
-NaVILA-Lite v2 – Final modular version
-- Hierarchical planner (heuristic + optional VLM)
-- OSM buildings/roads with better caching
-- Landmark + A*
-- Movement quality score
-- Explainability
+NaVILA-Lite v2 – Submission candidate
+Fixes:
+- Separate Execute buttons (Landmark vs Language)
+- Working landmark navigation (including long distance)
+- Dynamic OSM reload while moving
+- Safer HF token handling (env / secrets only)
 """
 
 import streamlit as st
@@ -25,49 +25,65 @@ from src.high_level.geocoder import geocode
 
 st.set_page_config(page_title="NaVILA-Lite v2", page_icon="🗺️", layout="wide")
 st.title("🗺️ NaVILA-Lite v2")
-st.caption("Hierarchical VLA-style navigation · Map semantics · Landmark · Score · Explainable")
+st.caption("Hierarchical navigation · Landmark routing · Dynamic OSM · Explainable")
 
 LOCATIONS = {
     "Taipei 101": (25.0339, 121.5640),
     "National Taiwan University": (25.0170, 121.5375),
     "Taipei Main Station": (25.0478, 121.5170),
     "Kaohsiung": (22.6275, 120.3010),
+    "Tainan": (23.0005, 120.2270),
     "Bangalore MG Road": (12.9760, 77.6060),
     "Open Field": (25.0510, 121.5810),
 }
 
+def get_hf_token():
+    # Priority: Streamlit secrets → environment variable
+    try:
+        return st.secrets.get("HF_TOKEN", None)
+    except Exception:
+        pass
+    return os.environ.get("HF_TOKEN", None)
+
 with st.sidebar:
     st.header("Controls")
     location_name = st.selectbox("Start Location", list(LOCATIONS.keys()))
-    load_osm = st.checkbox("Load OSM (buildings + roads)", value=False)
-    use_vlm = st.checkbox("Try lightweight VLM (needs HF_TOKEN)", value=False,
-                          help="Optional. Set HF_TOKEN env var. Falls back to heuristic.")
+    load_osm = st.checkbox("Load OSM (buildings + roads)", value=False,
+                           help="Local obstacles around the robot. Can be slow on first load.")
+    use_vlm = st.checkbox("Try lightweight VLM", value=False,
+                          help="Needs HF_TOKEN in environment or Streamlit secrets.")
 
     st.markdown("---")
-    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei Main Station")
-    use_astar = st.checkbox("Prefer A* road following", value=True)
+    st.subheader("1. Landmark Navigation")
+    landmark = st.text_input("Go to landmark", placeholder="e.g. Taipei 101 / Taipei Main Station")
+    use_astar = st.checkbox("Prefer A* when local road graph available", value=True)
+    landmark_btn = st.button("Execute Landmark", type="primary")
 
     st.markdown("---")
+    st.subheader("2. Language Instructions")
     instruction = st.text_area(
         "Language Instruction(s)",
         value="Move forward 70 meters then turn left 90 degrees then move 40 meters",
         height=90
     )
-    c1, c2 = st.columns(2)
-    exec_btn = c1.button("Execute", type="primary")
-    reset_btn = c2.button("Reset")
+    lang_btn = st.button("Execute Language")
+
+    st.markdown("---")
+    reset_btn = st.button("Reset to Location")
 
 if "ctrl" not in st.session_state:
     lat, lon = LOCATIONS["Taipei 101"]
     st.session_state.ctrl = OSMController(lat, lon)
-    st.session_state.planner = MapContextPlanner(use_vlm=False)
+    st.session_state.planner = MapContextPlanner(use_vlm=False, hf_token=get_hf_token())
     st.session_state.history = []
     st.session_state.loc = "Taipei 101"
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
     st.session_state.last_explanation = []
+    st.session_state.last_load_center = (lat, lon)
 
 ctrl: OSMController = st.session_state.ctrl
 st.session_state.planner.use_vlm = use_vlm
+st.session_state.planner.hf_token = get_hf_token()
 
 if reset_btn or location_name != st.session_state.loc:
     lat, lon = LOCATIONS[location_name]
@@ -76,74 +92,110 @@ if reset_btn or location_name != st.session_state.loc:
     st.session_state.last_explanation = []
     st.session_state.loc = location_name
     st.session_state.map_data = {"building_coords": [], "road_lines": [], "buildings": [], "road_graph": None}
+    st.session_state.last_load_center = (lat, lon)
     st.rerun()
 
+def maybe_load_osm(force=False):
+    """Load or refresh local OSM data around the robot."""
+    if not load_osm:
+        return
+    dist_moved = ctrl._distance_m(ctrl.lat, ctrl.lon,
+                                  st.session_state.last_load_center[0],
+                                  st.session_state.last_load_center[1])
+    need_load = force or st.session_state.map_data.get("road_graph") is None or dist_moved > 120
+    if need_load:
+        with st.spinner("Loading / refreshing local OSM data..."):
+            data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=280)
+            # merge lightly with existing to keep some history
+            if st.session_state.map_data.get("building_coords"):
+                data["building_coords"] = (st.session_state.map_data["building_coords"] + data.get("building_coords", []))[-60:]
+                data["road_lines"] = (st.session_state.map_data.get("road_lines", []) + data.get("road_lines", []))[-80:]
+            st.session_state.map_data = data
+            ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
+            st.session_state.last_load_center = (ctrl.lat, ctrl.lon)
+            if data.get("success"):
+                st.sidebar.success(f"OSM refreshed · Buildings: {len(data.get('building_coords',[]))} · Roads: {len(data.get('road_lines',[]))}")
+            else:
+                st.sidebar.warning(data.get("error", "OSM load failed"))
+
+# Initial optional load
 if load_osm and st.session_state.map_data.get("road_graph") is None:
-    with st.spinner("Loading OSM (cached when possible)..."):
-        data = load_buildings_and_roads(ctrl.lat, ctrl.lon, dist=350)
-        st.session_state.map_data = data
-        ctrl.set_map_data(data.get("buildings", []), data.get("road_graph"))
-        if data.get("success"):
-            st.sidebar.success(f"Buildings: {len(data.get('building_coords',[]))} | Roads: {len(data.get('road_lines',[]))}")
-        else:
-            st.sidebar.warning(data.get("error", "OSM load failed"))
+    maybe_load_osm(force=True)
 
 explanation = []
 
-if exec_btn:
+# -------------------- Landmark execution (separate) --------------------
+if landmark_btn and landmark.strip():
+    coords = geocode(landmark.strip())
+    if coords is None:
+        explanation.append(f"Could not geocode '{landmark}'")
+        st.sidebar.error("Landmark not found")
+    else:
+        tlat, tlon = coords
+        explanation.append(f"Geocoded '{landmark}' → ({tlat:.5f}, {tlon:.5f})")
+        dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
+        explanation.append(f"Distance to target: {dist/1000:.2f} km")
+
+        # Try local A* only for short distances
+        used_astar = False
+        if use_astar and dist < 1200 and ctrl.road_graph is not None:
+            waypoints = ctrl.plan_road_route(tlat, tlon)
+            if waypoints and len(waypoints) > 1:
+                ctrl.follow_waypoints(waypoints)
+                explanation.append(f"Used local A* ({len(waypoints)} nodes)")
+                used_astar = True
+                st.session_state.history.append(f"A* to '{landmark}'")
+
+        if not used_astar:
+            # Long-distance or no graph: move in segments toward target
+            # while still doing local obstacle avoidance
+            remaining = dist
+            max_segments = 40
+            seg = 0
+            while remaining > 15 and seg < max_segments:
+                # face target
+                dlat = tlat - ctrl.lat
+                dlon = tlon - ctrl.lon
+                ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+                step = min(80.0, remaining)
+                ctrl.move_forward(step)
+                remaining = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
+                seg += 1
+                # refresh local obstacles while traveling
+                if load_osm and seg % 3 == 0:
+                    maybe_load_osm()
+            explanation.append(f"Segmented navigation toward landmark ({seg} segments)")
+            st.session_state.history.append(f"Navigate to '{landmark}' ({dist/1000:.2f} km)")
+
+    st.session_state.last_explanation = explanation
+
+# -------------------- Language execution (separate) --------------------
+if lang_btn and instruction.strip():
     map_ctx = st.session_state.planner.build_map_context_summary(
         len(st.session_state.map_data.get("building_coords", [])),
         len(st.session_state.map_data.get("road_lines", [])),
         ctrl.lat, ctrl.lon
     )
-
-    if landmark.strip():
-        coords = geocode(landmark.strip())
-        if coords:
-            tlat, tlon = coords
-            explanation.append(f"Geocoded '{landmark}' → ({tlat:.5f}, {tlon:.5f})")
-            if use_astar and ctrl.road_graph is not None:
-                waypoints = ctrl.plan_road_route(tlat, tlon)
-                if waypoints:
-                    ctrl.follow_waypoints(waypoints)
-                    explanation.append(f"A* route ({len(waypoints)} nodes)")
-                    st.session_state.history.append(f"A* to '{landmark}'")
-                else:
-                    dlat, dlon = tlat - ctrl.lat, tlon - ctrl.lon
-                    ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                    dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-                    ctrl.move_forward(min(dist, 250))
-                    explanation.append("A* unavailable → direct movement")
-                    st.session_state.history.append(f"Direct to '{landmark}'")
-            else:
-                dlat, dlon = tlat - ctrl.lat, tlon - ctrl.lon
-                ctrl.yaw = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                dist = ctrl._distance_m(ctrl.lat, ctrl.lon, tlat, tlon)
-                ctrl.move_forward(min(dist, 250))
-                explanation.append("Direct movement")
-                st.session_state.history.append(f"Direct to '{landmark}'")
-        else:
-            explanation.append(f"Geocoding failed for '{landmark}'")
-
-    if instruction.strip():
-        cmds = st.session_state.planner.parse(instruction, map_context=map_ctx)
-        explanation.append(f"Planner produced {len(cmds)} command(s) (source: {cmds[0].source if cmds else 'none'})")
-        for cmd in cmds:
-            if cmd.action == "move_forward":
-                ctrl.move_forward(cmd.value or 30.0)
-            elif cmd.action == "turn_left":
-                ctrl.turn_left(cmd.value or 90.0)
-            elif cmd.action == "turn_right":
-                ctrl.turn_right(cmd.value or 90.0)
-            elif cmd.action == "return_home":
-                ctrl.return_home()
-            st.session_state.history.append(str(cmd))
-            explanation.append(f"Executed: {cmd}")
-
+    cmds = st.session_state.planner.parse(instruction, map_context=map_ctx)
+    explanation.append(f"Parsed {len(cmds)} command(s) · source={cmds[0].source if cmds else 'none'}")
+    for cmd in cmds:
+        if cmd.action == "move_forward":
+            ctrl.move_forward(cmd.value or 30.0)
+        elif cmd.action == "turn_left":
+            ctrl.turn_left(cmd.value or 90.0)
+        elif cmd.action == "turn_right":
+            ctrl.turn_right(cmd.value or 90.0)
+        elif cmd.action == "return_home":
+            ctrl.return_home()
+        st.session_state.history.append(str(cmd))
+        explanation.append(f"Executed: {cmd}")
+    # refresh OSM after movement
+    if load_osm:
+        maybe_load_osm()
     st.session_state.last_explanation = explanation
 
-# Map
-m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=16)
+# -------------------- Map --------------------
+m = folium.Map(location=[ctrl.lat, ctrl.lon], zoom_start=15)
 folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
@@ -165,9 +217,9 @@ for coords in st.session_state.map_data.get("building_coords", []):
         pass
 
 if len(ctrl.path) > 1:
-    folium.PolyLine(ctrl.path, color="#1e90ff", weight=6, opacity=0.9).add_to(m)
+    folium.PolyLine(ctrl.path, color="#1e90ff", weight=5, opacity=0.9).add_to(m)
 
-folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime").add_to(m)
+folium.CircleMarker(ctrl.path[0], radius=7, color="lime", fill=True, fill_color="lime", popup="Start").add_to(m)
 
 html = f"""
 <div style="transform: rotate({ctrl.yaw}deg); font-size: 24px; color: #00e676;
@@ -179,7 +231,7 @@ icon = folium.DivIcon(html=html, icon_size=(30, 30), icon_anchor=(15, 15))
 folium.Marker([ctrl.lat, ctrl.lon], icon=icon, popup=f"Yaw {ctrl.yaw:.0f}°").add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, width=1000, height=580, key=f"v2_{len(ctrl.path)}")
+st_folium(m, width=1000, height=560, key=f"map_{len(ctrl.path)}_{ctrl.lat:.5f}")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -190,7 +242,7 @@ with col1:
 
 with col2:
     st.subheader("Performance")
-    st.metric("Movement Score", f"{ctrl.score:.1f}")
+    st.metric("Score", f"{ctrl.score:.1f}")
     st.metric("Distance", f"{ctrl.total_distance:.0f} m")
     st.metric("Collisions", ctrl.collision_count)
 
@@ -208,6 +260,6 @@ if st.session_state.last_explanation:
     for line in st.session_state.last_explanation:
         st.markdown(f"- {line}")
 else:
-    st.info("Execute a command to see the reasoning trace.")
+    st.info("Execute Landmark or Language command to see reasoning.")
 
-st.caption("NaVILA-Lite v2 · Hierarchical navigation on real maps · Inspired by NaVILA (RSS 2025)")
+st.caption("NaVILA-Lite v2 · Separate landmark / language execution · Dynamic local OSM · Inspired by NaVILA")
