@@ -1,6 +1,5 @@
 """
-NaVILA-Lite: Interactive Hierarchical Vision-Language Navigation Demo
-Single Streamlit application
+NaVILA-Lite: Interactive Hierarchical Vision-Language Navigation
 """
 
 import streamlit as st
