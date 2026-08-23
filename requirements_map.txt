@@ -1,7 +1,9 @@
-streamlit
-folium
-streamlit-folium
+streamlit>=1.32
+folium>=0.16
+streamlit-folium>=0.20
+osmnx>=1.9
+shapely>=2.0
+networkx>=3.2
+requests>=2.31
+geopandas>=0.14
 numpy
-osmnx
-geopandas
-shapely
