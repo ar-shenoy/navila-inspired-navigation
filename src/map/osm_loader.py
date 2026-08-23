@@ -1,7 +1,6 @@
 """
-OSM Loader — progressive, fast, on-demand.
-Buildings-first (obstacles) for speed; roads optional.
-Load a modest area around the robot first, expand as it moves.
+OSM Loader — instant prebaked spawn + progressive live expand (<100m).
+Buildings = obstacles. Roads via public OSRM (not local graph).
 """
 
 from typing import Tuple, List, Dict, Optional
@@ -14,11 +13,15 @@ try:
     import osmnx as ox
     from shapely.geometry import Point
     HAS_OSMNX = True
-    ox.settings.timeout = 18  # fail fast — don't hang the UI
+    ox.settings.timeout = 12
     ox.settings.overpass_rate_limit = True
 except ImportError:
     HAS_OSMNX = False
     ox = None
+    try:
+        from shapely.geometry import Point
+    except ImportError:
+        Point = None  # type: ignore
 
 _cache: Dict[Tuple, dict] = {}
 _cache_timestamps: Dict[Tuple, float] = {}
@@ -27,20 +30,18 @@ CACHE_TTL = 1200
 DISK_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".osm_cache"
 DISK_CACHE_TTL = 3600 * 24
 
-# ~180m covers large landmarks (e.g. Taipei 101 footprint) without city-scale wait
-INITIAL_RADIUS_M = 180
-EXPAND_RADIUS_M = 100
-EXPAND_TRIGGER_M = 60
+INITIAL_RADIUS_M = 100
+EXPAND_RADIUS_M = 90  # <100m tiles
+EXPAND_TRIGGER_M = 55
 
 
-def _cache_key(lat: float, lon: float, dist: int, roads: bool) -> Tuple:
-    return (round(lat, 4), round(lon, 4), dist, int(roads))
+def _cache_key(lat: float, lon: float, dist: int) -> Tuple:
+    return (round(lat, 4), round(lon, 4), dist)
 
 
 def _disk_path(key: Tuple) -> Path:
     DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"osm_{key[0]}_{key[1]}_{key[2]}_r{key[3]}.pkl"
-    return DISK_CACHE_DIR / name
+    return DISK_CACHE_DIR / f"osm_{key[0]}_{key[1]}_{key[2]}.pkl"
 
 
 def _load_disk(key: Tuple) -> Optional[dict]:
@@ -62,7 +63,7 @@ def _save_disk(key: Tuple, data: dict):
             "buildings": data.get("buildings", []),
             "building_coords": data.get("building_coords", []),
             "road_lines": data.get("road_lines", []),
-            "road_graph": data.get("road_graph"),
+            "road_graph": None,
             "success": data.get("success", False),
             "error": data.get("error"),
             "center": data.get("center"),
@@ -85,6 +86,7 @@ def _empty_result(lat: float, lon: float, radius: int) -> dict:
         "from_cache": False,
         "center": (lat, lon),
         "radius": radius,
+        "source": "empty",
     }
 
 
@@ -95,36 +97,28 @@ def load_buildings_and_roads(
     use_cache: bool = True,
     load_roads: bool = False,
 ) -> dict:
-    """
-    Fast path: buildings only (obstacles).
-    Set load_roads=True only when you need a local walk graph.
-    """
+    """Live Overpass fetch (buildings only). May be slow — use only for expand."""
     result = _empty_result(lat, lon, dist)
-
     if not HAS_OSMNX:
         result["error"] = "OSMnx not installed"
         return result
 
-    key = _cache_key(lat, lon, dist, load_roads)
+    key = _cache_key(lat, lon, dist)
     now = time.time()
-
-    if use_cache and key in _cache:
-        if now - _cache_timestamps.get(key, 0) < CACHE_TTL:
-            cached = dict(_cache[key])
-            cached["from_cache"] = True
-            return cached
-
+    if use_cache and key in _cache and now - _cache_timestamps.get(key, 0) < CACHE_TTL:
+        cached = dict(_cache[key])
+        cached["from_cache"] = True
+        return cached
     if use_cache:
-        disk_data = _load_disk(key)
-        if disk_data is not None:
-            _cache[key] = disk_data
+        disk = _load_disk(key)
+        if disk is not None:
+            _cache[key] = disk
             _cache_timestamps[key] = now
-            out = dict(disk_data)
+            out = dict(disk)
             out["from_cache"] = True
             return out
 
     try:
-        # Buildings only — this is what we need for obstacle avoidance
         bldg_gdf = ox.features_from_point((lat, lon), tags={"building": True}, dist=dist)
         buildings, building_coords = [], []
         if bldg_gdf is not None and not bldg_gdf.empty:
@@ -140,34 +134,14 @@ def load_buildings_and_roads(
                         building_coords.append([(p[1], p[0]) for p in poly.exterior.coords])
         result["buildings"] = buildings
         result["building_coords"] = building_coords
-
-        # Roads optional (slow) — skip by default
-        if load_roads:
-            try:
-                G = ox.graph_from_point(
-                    (lat, lon), dist=dist, network_type="walk", simplify=True
-                )
-                result["road_graph"] = G
-                road_lines = []
-                for u, v, data in G.edges(data=True):
-                    if "geometry" in data:
-                        road_lines.append([(p[1], p[0]) for p in data["geometry"].coords])
-                    else:
-                        y1, x1 = G.nodes[u]["y"], G.nodes[u]["x"]
-                        y2, x2 = G.nodes[v]["y"], G.nodes[v]["x"]
-                        road_lines.append([(y1, x1), (y2, x2)])
-                result["road_lines"] = road_lines
-            except Exception as e:
-                result["error"] = f"Roads skipped: {str(e)[:50]}"
-
         result["success"] = True
         result["center"] = (lat, lon)
         result["radius"] = dist
+        result["source"] = "live"
         _cache[key] = result
         _cache_timestamps[key] = now
         _save_disk(key, result)
         return result
-
     except Exception as e:
         result["error"] = str(e)[:120]
         return result
@@ -176,29 +150,19 @@ def load_buildings_and_roads(
 def merge_map_data(base: dict, extra: dict) -> dict:
     if not extra or not extra.get("success"):
         return base or _empty_result(0, 0, 0)
-
     out = dict(base) if base else _empty_result(0, 0, 0)
     out["buildings"] = list(out.get("buildings") or []) + list(extra.get("buildings") or [])
     out["building_coords"] = list(out.get("building_coords") or []) + list(
         extra.get("building_coords") or []
     )
     out["road_lines"] = list(out.get("road_lines") or []) + list(extra.get("road_lines") or [])
-
-    if out.get("road_graph") is None and extra.get("road_graph") is not None:
-        out["road_graph"] = extra["road_graph"]
-    elif out.get("road_graph") is not None and extra.get("road_graph") is not None:
-        try:
-            import networkx as nx
-            out["road_graph"] = nx.compose(out["road_graph"], extra["road_graph"])
-        except Exception:
-            pass
-
     out["success"] = True
     old_r = out.get("radius") or 0
     new_r = extra.get("radius") or 0
-    out["radius"] = max(old_r, new_r) + (EXPAND_RADIUS_M // 2)
-    if not out.get("center"):
-        out["center"] = extra.get("center")
+    # covered radius grows with robot as center of scan
+    out["radius"] = max(old_r, new_r)
+    out["center"] = extra.get("center") or out.get("center")
+    out["source"] = "merged"
     return out
 
 
@@ -213,17 +177,25 @@ def needs_expansion(map_data: dict, lat: float, lon: float) -> bool:
     dlat = (lat - clat) * 111320.0
     dlon = (lon - clon) * 111320.0 * max(0.2, abs(math.cos(math.radians(lat))))
     dist = (dlat ** 2 + dlon ** 2) ** 0.5
-    return dist > max(25.0, radius - EXPAND_TRIGGER_M)
+    return dist > max(20.0, radius - EXPAND_TRIGGER_M)
 
 
 def expand_around(map_data: dict, lat: float, lon: float, dist: int = EXPAND_RADIUS_M) -> dict:
-    # buildings only on expand — keep it fast
+    """Scan-style: robot is center of a new <100m tile; merge into known map."""
+    dist = min(dist, 99)  # hard cap <100m
     extra = load_buildings_and_roads(lat, lon, dist=dist, use_cache=True, load_roads=False)
-    return merge_map_data(map_data, extra)
+    if not extra.get("success"):
+        # keep prebaked; do not fail the session
+        return map_data
+    merged = merge_map_data(map_data, extra)
+    # recent scan center follows the robot
+    merged["center"] = (lat, lon)
+    merged["radius"] = max(map_data.get("radius") or 0, dist)
+    return merged
 
 
 def point_in_buildings(lat: float, lon: float, buildings: list) -> bool:
-    if not buildings:
+    if not buildings or Point is None:
         return False
     pt = Point(lon, lat)
     for poly in buildings:
@@ -253,7 +225,7 @@ def find_free_spawn(lat: float, lon: float, buildings: list, max_radius_m: float
 
 
 def get_nearest_road_node(G, lat: float, lon: float):
-    if G is None:
+    if G is None or not HAS_OSMNX:
         return None
     try:
         return ox.distance.nearest_nodes(G, lon, lat)
